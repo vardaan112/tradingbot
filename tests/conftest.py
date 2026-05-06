@@ -61,6 +61,12 @@ def make_settings(**overrides):
         "HEARTBEAT_INTERVAL_SECONDS": 60.0,
         "ORCHESTRATOR_TICK_SECONDS": 15.0,
         "MAX_HOLD_BARS": 24,
+        "BOT_CAPITAL_BASE_USD": 0.0,
+        "RUN_LIVE_CANARY_ON_STARTUP": False,
+        "CANARY_SYMBOL": "XLF",
+        "CANARY_NOTIONAL_USD": 10.0,
+        "CANARY_TIMEOUT_SECONDS": 60.0,
+        "CANARY_PERSIST_FILENAME": "canary_state.json",
     }
     defaults.update(overrides)
     return Settings(_env_file=None, **defaults)

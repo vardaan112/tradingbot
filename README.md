@@ -54,11 +54,13 @@ src/
   strategies/
     base.py                        Strategy base + Signal types
     indicators.py                  RSI, ATR (Wilder)
-    universe.py                    price/volume/spread filters
-    rsi_mean_reversion.py          first conservative strategy
+    universe.py                    price/volume/spread filters (+ skip log)
+    rsi_strategy.py                canonical RSI mean reversion (long-only)
+    rsi_mean_reversion.py          backward-compat re-export of rsi_strategy
   services/
     orchestrator.py                top-level event loop
     heartbeat.py                   60s heartbeat task
+    canary.py                      one-time live canary check at startup
   utils/                           ids, math, price, time helpers
 runtime/                           persistent state (gitignored)
 logs/                              rotating log files (gitignored)
@@ -105,12 +107,19 @@ The full annotated reference lives in `.env.example`. The most important keys:
 | `DRY_RUN`                        | `true`         | Do not POST orders even if enabled |
 | `CONFIRM_LIVE_TRADING`           | empty          | Must equal `yes_i_understand` to enable live trading on the live endpoint |
 | `MAX_EQUITY_USAGE_USD`           | `50`           | Hard USD cap on bot-managed exposure |
-| `MAX_RISK_PER_TRADE_PCT`         | `0.01`         | 1% of equity per trade (hard ceiling) |
+| `MAX_RISK_PER_TRADE_PCT`         | `0.01`         | 1% of capital base per trade (hard ceiling) |
+| `BOT_CAPITAL_BASE_USD`           | `0`            | Bot's allocated capital slice in USD. When >0, risk is computed against this instead of full account equity. 0 = fall back to `min(equity, MAX_EQUITY_USAGE_USD)` |
 | `KILL_SWITCH_DRAWDOWN_PCT`       | `0.05`         | 5% intraday drawdown latches the switch |
 | `SPREAD_FILTER_PCT`              | `0.0005`       | 5 bps max relative spread |
 | `QUOTE_STALENESS_SECONDS`        | `5`            | Reject signals on quotes older than this |
 | `REGULATORY_MODE`                | `auto`         | `auto`, `pdt`, or `intraday_margin` |
 | `POST_RULE4210_SCALING_ENABLED`  | `false`        | Required to relax legacy throttles after 2026-06-04 |
+| `SYMBOLS`                        | `SPY,QQQ,IWM,XLF,EEM` | Static ETF basket for first live rollout |
+| `RUN_LIVE_CANARY_ON_STARTUP`     | `false`        | When true on the live endpoint, run a one-time round-trip trade at startup before the main loop |
+| `CANARY_SYMBOL`                  | `XLF`          | Symbol used for the canary trade |
+| `CANARY_NOTIONAL_USD`            | `10`           | Dollar size of the canary trade |
+| `CANARY_TIMEOUT_SECONDS`         | `60`           | Max seconds for the round trip |
+| `CANARY_PERSIST_FILENAME`        | `canary_state.json` | Filename under `STATE_DIR` for canary success persistence |
 
 **Never commit `.env`** - it is excluded by `.gitignore`.
 
@@ -152,8 +161,31 @@ ALPACA_ENV=live
 LIVE_TRADING_ENABLED=true
 DRY_RUN=false
 CONFIRM_LIVE_TRADING=yes_i_understand
-MAX_EQUITY_USAGE_USD=50          # keep tiny for the first deployment
+MAX_EQUITY_USAGE_USD=50            # keep tiny for the first deployment
+BOT_CAPITAL_BASE_USD=200           # the slice this bot is allowed to risk against
+RUN_LIVE_CANARY_ON_STARTUP=true    # run the one-time startup verification trade
+CANARY_SYMBOL=XLF                  # liquid, low-priced ETF for the canary
+CANARY_NOTIONAL_USD=50             # >= ~one share price of the canary symbol
 ```
+
+When `RUN_LIVE_CANARY_ON_STARTUP=true` is combined with the live endpoint
+(and the bot is *not* in dry-run), `main.py` invokes `canary_check(settings)`
+**before** the main loop. The canary:
+
+- Verifies credentials, market open, fresh in-spec quote, no kill-switch latch,
+  no existing position/order in the canary symbol, and broker compliance.
+- Submits a conservative DAY limit BUY for the smallest qty that fits
+  `CANARY_NOTIONAL_USD` (whole-share when `CANARY_NOTIONAL_USD` >= one share
+  price; fractional only if the asset is fractionable).
+- Waits up to `CANARY_TIMEOUT_SECONDS` for fill, then submits a marketable
+  limit IOC SELL at exactly the filled qty.
+- Persists success to `runtime/canary_state.json` so it does not re-run
+  again the same trading day.
+- Aborts startup on any failure (no fallback to market orders, ever).
+
+If your `CANARY_NOTIONAL_USD` is below one share price of the canary symbol,
+either raise it above a single share price or pick a fractionable canary
+symbol; the bot will refuse to fall back to a market order.
 
 Then run on the VPS, ideally under `systemd` or `supervisord`. A minimal
 systemd unit:
@@ -187,11 +219,16 @@ WantedBy=multi-user.target
    `errors.log` entries appear.
 4. Switch to paper live (`DRY_RUN=false`, paper endpoint) for at least one
    full session. Confirm orders and exits behave as expected.
-5. Switch endpoint to live with `MAX_EQUITY_USAGE_USD=50`. Run for at least
-   one full session.
-6. Review `risk.log` and `orders.log`. Only then incrementally raise
-   `MAX_EQUITY_USAGE_USD`.
-7. After 2026-06-04, do **not** flip `POST_RULE4210_SCALING_ENABLED=true`
+5. Switch endpoint to live with `MAX_EQUITY_USAGE_USD=50`,
+   `BOT_CAPITAL_BASE_USD=<your slice>`, and
+   `RUN_LIVE_CANARY_ON_STARTUP=true`. The bot will run the canary
+   automatically on first startup.
+6. Tail `logs/orders.log` and grep for `event=canary_*` to confirm
+   the round-trip flatten succeeded. The bot enters the main loop only
+   after `event=canary_complete`.
+7. Review `risk.log` and `orders.log`. Only then incrementally raise
+   `MAX_EQUITY_USAGE_USD` and/or `BOT_CAPITAL_BASE_USD`.
+8. After 2026-06-04, do **not** flip `POST_RULE4210_SCALING_ENABLED=true`
    until you have observed at least one full session in
    `intraday_margin` mode and reviewed account behavior end-to-end.
 

@@ -88,7 +88,7 @@ class Orchestrator:
         self._exposure = ExposureChecker(settings)
         self._sizer = PositionSizer(settings, self._compliance, self._exposure)
         self._strategy = RSIMeanReversionStrategy(settings)
-        self._universe = UniverseFilter(settings)
+        self._universe = UniverseFilter(settings, strategy_name=self._strategy.name)
         self._order_service: Optional[OrderService] = None
         self._heartbeat: Optional[HeartbeatService] = None
 

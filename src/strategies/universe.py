@@ -3,12 +3,20 @@
 The orchestrator uses `UniverseFilter.is_eligible` to decide whether a symbol
 should be considered for new entries this tick. Existing positions are still
 managed (exits, stops) regardless of universe eligibility.
+
+Logging contract:
+- A symbol skipped because of a wide spread emits a single structured
+  `event=strategy_skip_spread` log line including bid/ask/mid, spread_pct,
+  threshold, feed, quote_age_seconds, strategy, and timestamp.
+- All other skip reasons are returned in `EligibilityResult.reason` and
+  logged by the orchestrator at debug/info granularity to keep volume sane.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -16,7 +24,7 @@ import pandas as pd
 from config.constants import LOGGER_STRATEGY
 from config.settings import Settings
 from core.market_data import Quote
-from utils.price_utils import is_valid_quote, spread_pct
+from utils.price_utils import is_valid_quote, mid_price, spread_pct
 
 
 @dataclass(frozen=True)
@@ -28,8 +36,9 @@ class EligibilityResult:
 class UniverseFilter:
     """Apply price, liquidity, and quote-quality filters to a symbol."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, strategy_name: str = "rsi_meanrev") -> None:
         self._settings = settings
+        self._strategy_name = strategy_name
         self._log = logging.getLogger(LOGGER_STRATEGY)
 
     def is_eligible(
@@ -61,7 +70,11 @@ class UniverseFilter:
         except ValueError:
             return EligibilityResult(False, "spread_compute_failed")
         if sp > self._settings.SPREAD_FILTER_PCT:
-            return EligibilityResult(False, f"spread_{sp:.5f}_above_{self._settings.SPREAD_FILTER_PCT:.5f}")
+            self._log_spread_skip(symbol=symbol, quote=quote, spread=sp)
+            return EligibilityResult(
+                False,
+                f"spread_{sp:.5f}_above_{self._settings.SPREAD_FILTER_PCT:.5f}",
+            )
 
         # Price filter on most recent close (or quote mid if no bars).
         if bars is None or bars.empty:
@@ -69,7 +82,9 @@ class UniverseFilter:
         else:
             ref_price = float(bars["close"].iloc[-1])
         if ref_price < self._settings.MIN_PRICE:
-            return EligibilityResult(False, f"price_{ref_price:.4f}_below_{self._settings.MIN_PRICE}")
+            return EligibilityResult(
+                False, f"price_{ref_price:.4f}_below_{self._settings.MIN_PRICE}"
+            )
 
         # Average dollar volume over the past N bars (use up to 20).
         if bars is not None and not bars.empty and "volume" in bars.columns:
@@ -83,3 +98,25 @@ class UniverseFilter:
                     )
 
         return EligibilityResult(True, "ok")
+
+    def _log_spread_skip(self, *, symbol: str, quote: Quote, spread: float) -> None:
+        try:
+            mid = mid_price(quote.bid, quote.ask)
+        except ValueError:
+            mid = 0.0
+        self._log.info(
+            "event=strategy_skip_spread symbol=%s bid=%.4f ask=%.4f mid=%.4f "
+            "spread_pct=%.6f spread_threshold=%.6f feed=%s "
+            "quote_age_seconds=%.4f strategy=%s timestamp=%s",
+            symbol,
+            quote.bid,
+            quote.ask,
+            mid,
+            spread,
+            self._settings.SPREAD_FILTER_PCT,
+            quote.feed,
+            quote.age_seconds(),
+            self._strategy_name,
+            datetime.now(timezone.utc).isoformat(),
+            extra={"symbol": symbol, "strategy": self._strategy_name},
+        )

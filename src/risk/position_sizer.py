@@ -1,16 +1,24 @@
 """ATR-based position sizing with hard clamps.
 
 Sizing pipeline:
-1. risk_budget = equity * MAX_RISK_PER_TRADE_PCT
-2. stop_distance = ATR * ATR_STOP_MULTIPLIER
-3. raw_shares = floor(risk_budget / stop_distance)
-4. clamp by:
+1. capital_base = settings.resolved_capital_base(account.equity)
+   - settings.BOT_CAPITAL_BASE_USD if > 0
+   - otherwise min(account.equity, MAX_EQUITY_USAGE_USD)
+2. risk_budget = capital_base * MAX_RISK_PER_TRADE_PCT
+3. stop_distance = ATR * ATR_STOP_MULTIPLIER
+4. raw_shares = floor(risk_budget / stop_distance) (or fractional when enabled)
+5. clamp by:
      - MAX_EQUITY_USAGE_USD / entry_price
      - available buying power (compliance-aware)
      - MAX_GROSS_EXPOSURE_PCT
-     - MAX_OPEN_POSITIONS
-5. integer shares unless ENABLE_FRACTIONAL=True (default false)
-6. final < 1 -> skip trade
+     - MAX_OPEN_POSITIONS (via ExposureChecker)
+     - bot-managed remaining notional
+6. integer shares unless ENABLE_FRACTIONAL=True (default false)
+7. final < 1 -> skip trade
+
+The change from "risk a percent of total account equity" to "risk a percent
+of the bot's allocated capital slice" matters when the brokerage account
+holds capital outside the bot's mandate. The bot must risk only its slice.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ class PositionSize:
     entry_price: float
     stop_distance: float
     risk_budget: float
+    capital_base: float
     rationale: str
     skipped_reason: Optional[str] = None
 
@@ -73,17 +82,32 @@ class PositionSizer:
         if account.equity <= 0:
             return self._skip(symbol, "non_positive_equity", entry_price=entry_price)
 
-        risk_budget = account.equity * self._settings.MAX_RISK_PER_TRADE_PCT
+        capital_base = self._settings.resolved_capital_base(account.equity)
+        if capital_base <= 0:
+            return self._skip(
+                symbol,
+                "non_positive_capital_base",
+                entry_price=entry_price,
+                capital_base=capital_base,
+            )
+
+        risk_budget = capital_base * self._settings.MAX_RISK_PER_TRADE_PCT
         stop_distance = atr * self._settings.ATR_STOP_MULTIPLIER
         if stop_distance <= 0:
-            return self._skip(symbol, "non_positive_stop_distance", entry_price=entry_price)
+            return self._skip(
+                symbol,
+                "non_positive_stop_distance",
+                entry_price=entry_price,
+                capital_base=capital_base,
+            )
 
         raw_shares = risk_budget / stop_distance
 
-        # USD cap
+        # USD cap (hard ceiling on bot-managed notional, independent of capital base)
         usd_cap_shares = self._settings.MAX_EQUITY_USAGE_USD / entry_price
 
-        # Buying power cap (compliance-aware)
+        # Buying power cap (compliance-aware: never reads daytrading_buying_power
+        # in intraday_margin mode).
         bp = self._compliance.buying_power(account)
         bp_shares = bp / entry_price if bp > 0 else 0.0
 
@@ -114,12 +138,24 @@ class PositionSizer:
             shares = max(0.0, math.floor(clamped * 1000.0) / 1000.0)
 
         if shares < 1.0:
+            self._log_sizing(
+                symbol=symbol,
+                capital_base=capital_base,
+                risk_budget=risk_budget,
+                atr=atr,
+                stop_distance=stop_distance,
+                raw_shares=raw_shares,
+                clamping_reason=clamping_reason,
+                final_shares=shares,
+                outcome="skip",
+            )
             return self._skip(
                 symbol,
                 f"clamped_to_<1_via_{clamping_reason}",
                 entry_price=entry_price,
                 stop_distance=stop_distance,
                 risk_budget=risk_budget,
+                capital_base=capital_base,
             )
 
         # Final exposure check (defense in depth)
@@ -131,14 +167,37 @@ class PositionSizer:
             bot_managed_notional=bot_managed_notional,
         )
         if not decision.allowed:
+            self._log_sizing(
+                symbol=symbol,
+                capital_base=capital_base,
+                risk_budget=risk_budget,
+                atr=atr,
+                stop_distance=stop_distance,
+                raw_shares=raw_shares,
+                clamping_reason=f"exposure:{decision.reason}",
+                final_shares=0.0,
+                outcome="skip",
+            )
             return self._skip(
                 symbol,
                 f"exposure_check:{decision.reason}",
                 entry_price=entry_price,
                 stop_distance=stop_distance,
                 risk_budget=risk_budget,
+                capital_base=capital_base,
             )
 
+        self._log_sizing(
+            symbol=symbol,
+            capital_base=capital_base,
+            risk_budget=risk_budget,
+            atr=atr,
+            stop_distance=stop_distance,
+            raw_shares=raw_shares,
+            clamping_reason=clamping_reason,
+            final_shares=shares,
+            outcome="ok",
+        )
         return PositionSize(
             symbol=symbol,
             shares=shares,
@@ -146,7 +205,37 @@ class PositionSizer:
             entry_price=entry_price,
             stop_distance=stop_distance,
             risk_budget=risk_budget,
+            capital_base=capital_base,
             rationale=f"clamped_by={clamping_reason}",
+        )
+
+    def _log_sizing(
+        self,
+        *,
+        symbol: str,
+        capital_base: float,
+        risk_budget: float,
+        atr: float,
+        stop_distance: float,
+        raw_shares: float,
+        clamping_reason: str,
+        final_shares: float,
+        outcome: str,
+    ) -> None:
+        self._log.info(
+            "event=sizing outcome=%s symbol=%s capital_base=%.4f "
+            "risk_budget=%.6f atr=%.6f stop_distance=%.6f raw_shares=%.4f "
+            "clamping_reason=%s final_shares=%.4f",
+            outcome,
+            symbol,
+            capital_base,
+            risk_budget,
+            atr,
+            stop_distance,
+            raw_shares,
+            clamping_reason,
+            final_shares,
+            extra={"symbol": symbol},
         )
 
     def _skip(
@@ -157,6 +246,7 @@ class PositionSizer:
         entry_price: float = 0.0,
         stop_distance: float = 0.0,
         risk_budget: float = 0.0,
+        capital_base: float = 0.0,
     ) -> PositionSize:
         self._log.info(
             "Sizing skip for %s: %s",
@@ -171,6 +261,7 @@ class PositionSizer:
             entry_price=entry_price,
             stop_distance=stop_distance,
             risk_budget=risk_budget,
+            capital_base=capital_base,
             rationale=reason,
             skipped_reason=reason,
         )

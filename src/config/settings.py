@@ -61,7 +61,10 @@ class Settings(BaseSettings):
     ORCHESTRATOR_TICK_SECONDS: float = Field(15.0, ge=1.0, le=300.0)
 
     # ---- Universe and bars ---------------------------------------------------------
-    SYMBOLS: str = "AAPL,MSFT,SPY"
+    # Default basket: small static set of liquid ETFs covering broad equities,
+    # tech, small caps, financials, and emerging markets. Intentionally static
+    # for the first live rollout - no dynamic screener.
+    SYMBOLS: str = "SPY,QQQ,IWM,XLF,EEM"
     BAR_TIMEFRAME: Literal["1Min", "5Min", "15Min", "1Hour", "1Day"] = "5Min"
 
     # ---- Strategy parameters -------------------------------------------------------
@@ -79,6 +82,13 @@ class Settings(BaseSettings):
     MAX_GROSS_EXPOSURE_PCT: float = Field(0.5, gt=0.0, le=2.0)
     MAX_OPEN_POSITIONS: int = Field(1, ge=1, le=100)
     KILL_SWITCH_DRAWDOWN_PCT: float = Field(0.05, gt=0.0, le=0.5)
+
+    # The dollar capital base the bot is allocated. When >0 this overrides
+    # full account equity for risk-budget computation, so the bot only risks
+    # a percentage of *its* slice rather than the whole brokerage account.
+    # 0 means "not configured": the sizer falls back to
+    # min(account.equity, MAX_EQUITY_USAGE_USD).
+    BOT_CAPITAL_BASE_USD: float = Field(0.0, ge=0.0)
 
     # ---- Quote / execution filters -------------------------------------------------
     SPREAD_FILTER_PCT: float = Field(0.0005, gt=0.0, le=0.05)
@@ -101,6 +111,16 @@ class Settings(BaseSettings):
 
     # ---- Optional features ---------------------------------------------------------
     ENABLE_FRACTIONAL: bool = False
+
+    # ---- Live canary check (one-time per day, before main loop) --------------------
+    # The canary verifies credentials, order submission, fills, reconciliation,
+    # and clean flatten end-to-end with a tiny live trade. It only runs on the
+    # live endpoint with LIVE_TRADING_ENABLED=true and DRY_RUN=false.
+    RUN_LIVE_CANARY_ON_STARTUP: bool = False
+    CANARY_SYMBOL: str = "XLF"
+    CANARY_NOTIONAL_USD: float = Field(10.0, gt=0.0)
+    CANARY_TIMEOUT_SECONDS: float = Field(60.0, gt=0.0, le=600.0)
+    CANARY_PERSIST_FILENAME: str = "canary_state.json"
 
     # ---- Validators ----------------------------------------------------------------
     @field_validator("ALPACA_ENV")
@@ -145,6 +165,27 @@ class Settings(BaseSettings):
             if not sym.isascii() or not all(c.isalnum() or c in {".", "-", "/"} for c in sym):
                 raise ValueError(f"SYMBOLS contains invalid ticker: {sym!r}")
         return cleaned
+
+    @field_validator("CANARY_SYMBOL")
+    @classmethod
+    def _validate_canary_symbol(cls, v: str) -> str:
+        sym = v.strip().upper()
+        if not sym:
+            raise ValueError("CANARY_SYMBOL must not be empty")
+        if not sym.isascii() or not all(c.isalnum() or c in {".", "-", "/"} for c in sym):
+            raise ValueError(f"CANARY_SYMBOL invalid ticker: {sym!r}")
+        return sym
+
+    @field_validator("CANARY_PERSIST_FILENAME")
+    @classmethod
+    def _validate_canary_filename(cls, v: str) -> str:
+        name = v.strip()
+        if not name:
+            raise ValueError("CANARY_PERSIST_FILENAME must not be empty")
+        # Disallow path separators - this is just a filename under STATE_DIR.
+        if any(sep in name for sep in ("/", "\\", "..")):
+            raise ValueError(f"CANARY_PERSIST_FILENAME must be a bare filename: {name!r}")
+        return name
 
     @model_validator(mode="after")
     def _validate_consistency(self) -> "Settings":
@@ -221,6 +262,21 @@ class Settings(BaseSettings):
     @property
     def is_regulatory_intraday(self) -> bool:
         return self.REGULATORY_MODE == REGULATORY_MODE_INTRADAY_MARGIN
+
+    def resolved_capital_base(self, account_equity: float) -> float:
+        """Return the capital base used for per-trade risk budgeting.
+
+        - If BOT_CAPITAL_BASE_USD > 0 the operator has explicitly allocated a
+          slice of the account; that wins.
+        - Otherwise we fall back to the smaller of the account's equity and
+          the bot-managed MAX_EQUITY_USAGE_USD cap, so an underfunded account
+          never inflates risk and a large account never lets the bot risk
+          beyond its hard USD ceiling.
+        """
+        if self.BOT_CAPITAL_BASE_USD > 0:
+            return float(self.BOT_CAPITAL_BASE_USD)
+        eq = max(0.0, float(account_equity))
+        return min(eq, float(self.MAX_EQUITY_USAGE_USD))
 
 
 @lru_cache(maxsize=1)
