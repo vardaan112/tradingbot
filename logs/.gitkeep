@@ -1,0 +1,2 @@
+# Rotating log files are written into this directory at runtime.
+# All *.log* files are gitignored.

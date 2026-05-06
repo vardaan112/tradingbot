@@ -1,0 +1,2 @@
+# Persistent runtime state JSONs (kill switch, daily equity, etc.)
+# All *.json files are gitignored.
