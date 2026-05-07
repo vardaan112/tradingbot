@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -31,6 +31,13 @@ from .base import Signal, SignalAction, Strategy, StrategyContext
 from .filters import RegimeSnapshot, compute_regime_snapshot
 from .indicators import atr, rsi
 from .sentiment import sentiment_overlay_neutral
+from .skip_diagnostics import (
+    SkipCodes,
+    SkipDiagnosticsThrottle,
+    SkipReason,
+    emit_skip_diagnostic,
+    regime_skip_reason,
+)
 
 # Mapping from BAR_TIMEFRAME string to a timedelta used to drop an in-progress
 # trailing bar. Keep in sync with `core.market_data._parse_timeframe`.
@@ -102,6 +109,7 @@ class RSIMeanReversionStrategy(Strategy):
         self._state_store = state_store
         self._database = database
         self._trails_by_symbol: dict[str, TrailState] = {}
+        self._skip_diag_throttle = SkipDiagnosticsThrottle()
         self._load_trailing_from_disk()
 
     def set_runtime_thresholds(self, rt: StrategyRuntimeThresholds) -> None:
@@ -266,6 +274,25 @@ class RSIMeanReversionStrategy(Strategy):
                 out["recent_trade_outcomes"] = ctx.recent_trade_outcomes_hint
         return out
 
+    def _sector_for_symbol(self, symbol: str) -> str:
+        return self._settings.sector_for_symbol(symbol)
+
+    def _resolve_rsi_entry_threshold(
+        self,
+        *,
+        atr_value: float,
+        last_close: float,
+    ) -> tuple[float, float, str]:
+        atr_pct = (atr_value / last_close) if last_close > 0 else 0.0
+        high_vol = atr_pct > float(self._settings.HIGH_VOL_ATR_PCT_THRESHOLD)
+        threshold = (
+            float(self._settings.HIGH_VOL_RSI_ENTRY)
+            if high_vol
+            else float(self._settings.DEFAULT_RSI_ENTRY)
+        )
+        tier = "HIGH_VOL" if high_vol else "NORMAL_VOL"
+        return threshold, atr_pct, tier
+
     # ------------------------------------------------------------------ logging
 
     def _log_signal(
@@ -302,12 +329,27 @@ class RSIMeanReversionStrategy(Strategy):
             str(sentiment_label_txt) if sentiment_label_txt is not None else "n_a"
         )
         risk_mode_repr = str(ov.get("risk_mode") or "n_a")
+        vol_tier_repr = str(ov.get("volatility_tier") or "n_a")
+        atr_pct_repr = (
+            f"{float(ov.get('atr_pct')):.6f}"
+            if isinstance(ov.get("atr_pct"), int | float)
+            else "n_a"
+        )
+        rsi_thr_repr = (
+            f"{float(ov.get('rsi_threshold_used')):.4f}"
+            if isinstance(ov.get("rsi_threshold_used"), int | float)
+            else "n_a"
+        )
+        sector_repr = str(ov.get("sector") or "Unknown")
+        sma_pass_repr = str(bool(ov.get("sma_filter_passed", True))).lower()
+        aggr_bypass_repr = str(bool(ov.get("aggressive_sma_bypassed", False))).lower()
         self._log.info(
             "event=strategy_signal symbol=%s action=%s reason=%s "
             "rsi=%.4f atr=%.6f close=%.4f bid=%.4f ask=%.4f "
             "spread_pct=%.6f quote_age_seconds=%.4f regime_type=%s "
             "trailing_stop_active=%s sentiment_score=%s sentiment_label=%s "
-            "risk_mode=%s strategy=%s",
+            "risk_mode=%s sector=%s volatility_tier=%s atr_pct=%s rsi_threshold=%s "
+            "sma_filter_passed=%s aggressive_sma_bypassed=%s strategy=%s",
             signal.symbol,
             signal.action.value,
             signal.reason,
@@ -323,8 +365,48 @@ class RSIMeanReversionStrategy(Strategy):
             sentiment_score_repr,
             sentiment_label_repr,
             risk_mode_repr,
+            sector_repr,
+            vol_tier_repr,
+            atr_pct_repr,
+            rsi_thr_repr,
+            sma_pass_repr,
+            aggr_bypass_repr,
             self.name,
             extra={"symbol": signal.symbol, "strategy": self.name},
+        )
+
+    def _emit_strategy_entry_skip(
+        self,
+        sr: SkipReason,
+        *,
+        log_event: str = "strategy_entry_skip",
+        discord_title: str = "ENTRY_SKIP",
+    ) -> None:
+        if "decision_fn" not in sr.metadata:
+            sr = replace(
+                sr,
+                metadata={"decision_fn": "RSIMeanReversionStrategy.evaluate", **dict(sr.metadata)},
+            )
+        actionable_for_discord = {
+            SkipCodes.SIZE_ZERO,
+            SkipCodes.STALE_BARS,
+            SkipCodes.SPREAD_TOO_WIDE,
+            SkipCodes.ORDER_REJECTED,
+            SkipCodes.RISK_LIMIT_FAIL,
+            SkipCodes.ADX_FILTER_FAIL,
+            SkipCodes.SMA_FILTER_FAIL,
+            SkipCodes.AGGRESSIVE_SMA_BYPASS,
+        }
+        emit_skip_diagnostic(
+            settings=self._settings,
+            logger=self._log,
+            log_event=log_event,
+            sr=sr,
+            discord_enqueue=self._discord_embed_fn if sr.code in actionable_for_discord else None,
+            throttle=self._skip_diag_throttle,
+            strategy_name=self.name,
+            phase="strategy",
+            discord_title=discord_title,
         )
 
     def _log_regime_skip(
@@ -334,24 +416,45 @@ class RSIMeanReversionStrategy(Strategy):
         reason: str,
         regime: RegimeSnapshot,
         rsi_value: float,
+        atr_value: float,
+        quote: Quote | None,
+        last_close: float,
+        bar_ts: datetime | None,
+        extra_meta: Mapping[str, object] | None = None,
     ) -> None:
-        ts = datetime.now(UTC).isoformat()
-        self._log.info(
-            "event=strategy_skip_regime symbol=%s reason=%s regime_type=%s "
-            "adx=%.4f sma200=%.4f sma_slope=%.6f price_above_sma200=%s "
-            "rsi=%.4f trailing_stop_active=false strategy=%s timestamp=%s",
-            symbol,
-            reason,
-            regime.regime_type,
-            regime.adx,
-            regime.sma200,
-            regime.sma_slope,
-            str(regime.price_above_sma200).lower(),
-            rsi_value,
-            self.name,
-            ts,
-            extra={"symbol": symbol, "strategy": self.name},
+        sr = regime_skip_reason(
+            symbol=symbol,
+            regime_reason=reason,
+            rsi_value=rsi_value,
+            last_close=last_close,
+            regime=regime,
+            quote=quote,
         )
+        slope_fail = float(regime.sma_slope) <= 0.0
+        adx_fail = float(regime.adx) >= float(self._thr.adx_range_max)
+        code = SkipCodes.ADX_FILTER_FAIL if adx_fail else SkipCodes.SMA_FILTER_FAIL
+        msg = "regime blocked by adx/sma filter"
+        if adx_fail and slope_fail:
+            msg = "regime blocked by adx>=threshold and non-positive sma slope"
+        elif adx_fail:
+            msg = "regime blocked by adx filter"
+        elif slope_fail:
+            msg = "regime blocked by sma slope filter"
+        sr = replace(
+            sr,
+            code=code,
+            message=msg,
+            atr=atr_value,
+            strategy_bar_ts=bar_ts,
+            metadata={
+                **dict(sr.metadata),
+                "adx_fail": adx_fail,
+                "sma_slope_fail": slope_fail,
+                "adx_threshold": float(self._thr.adx_range_max),
+                **(dict(extra_meta) if extra_meta is not None else {}),
+            },
+        )
+        self._emit_strategy_entry_skip(sr, log_event="strategy_skip_regime")
 
     def _build_metadata_core(
         self,
@@ -391,23 +494,26 @@ class RSIMeanReversionStrategy(Strategy):
         symbol: str,
         overlay: Mapping[str, object],
         rsi_value: float,
+        common_meta: Mapping[str, object] | None = None,
     ) -> None:
         ts = datetime.now(UTC).isoformat()
         headline_count = int(overlay.get("sentiment_headline_count") or 0)
         stale = bool(overlay.get("sentiment_stale_news", False))
-        self._log.info(
-            "event=strategy_skip_sentiment symbol=%s sentiment_score=%s sentiment_label=%s "
-            "reason=%s headline_count=%d stale_news=%s timestamp=%s strategy=%s",
-            symbol,
-            str(overlay.get("sentiment_score", "n_a")),
-            str(overlay.get("sentiment_label", "n_a")),
-            str(overlay.get("sentiment_reason", "blocked_long")),
-            headline_count,
-            str(stale).lower(),
-            ts,
-            self.name,
-            extra={"symbol": symbol, "strategy": self.name},
+        sr = SkipReason(
+            code=SkipCodes.RISK_LIMIT_FAIL,
+            message=str(overlay.get("sentiment_reason", "blocked_long")),
+            symbol=symbol,
+            rsi=rsi_value,
+            metadata={
+                **(dict(common_meta) if common_meta is not None else {}),
+                "sentiment_score": overlay.get("sentiment_score"),
+                "sentiment_label": overlay.get("sentiment_label"),
+                "sentiment_blocks_long_entries": overlay.get("sentiment_blocks_long_entries"),
+                "headline_count": headline_count,
+                "stale_news": stale,
+            },
         )
+        self._emit_strategy_entry_skip(sr, log_event="strategy_skip_sentiment")
         if self._database is not None:
             with contextlib.suppress(Exception):
                 self._database.record_execution_event(
@@ -435,6 +541,15 @@ class RSIMeanReversionStrategy(Strategy):
 
         bars = self._completed_bars(ctx.bars)
         if bars is None or bars.empty:
+            nrow = 0 if ctx.bars is None else len(ctx.bars)
+            self._emit_strategy_entry_skip(
+                SkipReason(
+                    code=SkipCodes.NO_COMPLETED_BARS,
+                    message="no_completed_closed_bars_ready_for_indicators",
+                    symbol=ctx.symbol.upper(),
+                    metadata={"raw_bar_rows": nrow},
+                ),
+            )
             return signals
 
         regime = compute_regime_snapshot(bars=bars, settings=self._risk_overlay_settings())
@@ -442,6 +557,15 @@ class RSIMeanReversionStrategy(Strategy):
 
         rsi_series, atr_series = self._compute(bars)
         if rsi_series.empty or atr_series.empty:
+            min_len = max(self._settings.RSI_LENGTH, self._settings.ATR_LENGTH) + 5
+            self._emit_strategy_entry_skip(
+                SkipReason(
+                    code=SkipCodes.INDICATOR_WARMUP,
+                    message="rsi_or_atr_series_empty_need_more_completed_bars",
+                    symbol=ctx.symbol.upper(),
+                    metadata={"completed_bar_rows": len(bars), "min_rows": min_len},
+                ),
+            )
             return signals
 
         last_rsi = float(rsi_series.iloc[-1])
@@ -458,9 +582,49 @@ class RSIMeanReversionStrategy(Strategy):
             bar_ts = None
 
         if pd.isna(last_rsi) or pd.isna(last_atr) or last_atr <= 0 or last_close <= 0:
+            self._emit_strategy_entry_skip(
+                SkipReason(
+                    code=SkipCodes.INVALID_INDICATORS,
+                    message="nan_or_non_positive_rsi_atr_or_close",
+                    symbol=ctx.symbol.upper(),
+                    rsi=None if pd.isna(last_rsi) else float(last_rsi),
+                    price=last_close if last_close > 0 else None,
+                    atr=last_atr if last_atr > 0 else None,
+                    strategy_bar_ts=bar_ts,
+                    metadata={
+                        "last_atr": last_atr,
+                        "last_close": last_close,
+                    },
+                ),
+            )
             return signals
 
         symbol = ctx.symbol.upper()
+        sector = self._sector_for_symbol(symbol)
+        rsi_entry_threshold, atr_pct, volatility_tier = self._resolve_rsi_entry_threshold(
+            atr_value=last_atr,
+            last_close=last_close,
+        )
+        rsi_triggered = bool(last_rsi < rsi_entry_threshold)
+        aggressive_mode = bool(self._settings.AGGRESSIVE_MODE)
+        aggressive_bypass_threshold = float(self._settings.AGGRESSIVE_RSI_BYPASS_THRESHOLD)
+        aggressive_bypass_candidate = aggressive_mode and (last_rsi < aggressive_bypass_threshold)
+
+        self._log.info(
+            "event=strategy_volatility_gate code=%s symbol=%s sector=%s price=%.4f atr=%.6f "
+            "atr_pct=%.6f volatility_tier=%s rsi=%.4f rsi_threshold=%.4f triggered=%s",
+            SkipCodes.VOLATILITY_THRESHOLD_USED,
+            symbol,
+            sector,
+            last_close,
+            last_atr,
+            atr_pct,
+            volatility_tier,
+            last_rsi,
+            rsi_entry_threshold,
+            str(rsi_triggered).lower(),
+            extra={"symbol": symbol, "strategy": self.name},
+        )
 
         def trailing_view(tr_state: TrailState) -> MutableMapping[str, object]:
             return {
@@ -479,6 +643,15 @@ class RSIMeanReversionStrategy(Strategy):
             bar_timestamp=bar_ts,
             quote=ctx.quote,
         )
+        common_meta = {
+            "sector": sector,
+            "atr_pct": atr_pct,
+            "volatility_tier": volatility_tier,
+            "rsi_threshold_used": rsi_entry_threshold,
+            "rsi_triggered": rsi_triggered,
+            "aggressive_mode": aggressive_mode,
+            "aggressive_rsi_bypass_threshold": aggressive_bypass_threshold,
+        }
 
         # ----------------- exits first ------------------------------------
         if ctx.has_position:
@@ -636,20 +809,126 @@ class RSIMeanReversionStrategy(Strategy):
             self._persist_trailing_to_disk()
 
         # ----------------- entries ----------------------------------------
-        if ctx.has_open_order or ctx.quote is None:
-            return signals
-        if last_rsi >= self._thr.rsi_oversold:
-            return signals
+        sp_live: float | None = None
+        qa_live: float | None = None
+        if ctx.quote is not None:
+            try:
+                qa_live = float(ctx.quote.age_seconds())
+            except (AttributeError, TypeError, ValueError):
+                qa_live = None
+            try:
+                if ctx.quote.bid > 0 and ctx.quote.ask > ctx.quote.bid:
+                    sp_live = float(compute_spread_pct(ctx.quote.bid, ctx.quote.ask))
+            except ValueError:
+                sp_live = None
 
-        if not regime_eff.allow_rsi_long:
-            self._log_regime_skip(
-                symbol=symbol,
-                reason=regime_eff.reason,
-                regime=regime_eff,
-                rsi_value=last_rsi,
+        if ctx.has_open_order:
+            self._emit_strategy_entry_skip(
+                SkipReason(
+                    code=SkipCodes.OPEN_ORDER_BLOCKS_ENTRY,
+                    message="working_order_present_strategy_skips_additional_long_entry",
+                    symbol=symbol,
+                    rsi=last_rsi,
+                    atr=last_atr,
+                    price=last_close,
+                    spread_pct=sp_live,
+                    quote_age_seconds=qa_live,
+                    strategy_bar_ts=bar_ts,
+                    open_order_exists=True,
+                    metadata=dict(common_meta),
+                ),
+            )
+            return signals
+        if ctx.quote is None:
+            self._emit_strategy_entry_skip(
+                SkipReason(
+                    code=SkipCodes.QUOTE_INVALID,
+                    message="no_quote_in_strategy_context_cannot_validate_spread_or_price",
+                    symbol=symbol,
+                    rsi=last_rsi,
+                    atr=last_atr,
+                    price=last_close,
+                    strategy_bar_ts=bar_ts,
+                    metadata=dict(common_meta),
+                ),
+            )
+            return signals
+        if last_rsi >= rsi_entry_threshold:
+            self._emit_strategy_entry_skip(
+                SkipReason(
+                    code=SkipCodes.RSI_NOT_TRIGGERED,
+                    message=(
+                        f"rsi_not_strictly_below_oversold "
+                        f"rsi={last_rsi:.4f} threshold={rsi_entry_threshold:.4f}"
+                    ),
+                    symbol=symbol,
+                    rsi=last_rsi,
+                    atr=last_atr,
+                    price=last_close,
+                    spread_pct=sp_live,
+                    quote_age_seconds=qa_live,
+                    strategy_bar_ts=bar_ts,
+                    metadata={
+                        **dict(common_meta),
+                        "rsi_oversold_threshold": float(rsi_entry_threshold),
+                    },
+                ),
             )
             return signals
 
+        aggressive_bypass_used = False
+        if not regime_eff.allow_rsi_long:
+            slope_fail = float(regime_eff.sma_slope) <= 0.0
+            adx_fail = float(regime_eff.adx) >= float(self._thr.adx_range_max)
+            if aggressive_bypass_candidate and slope_fail and not adx_fail:
+                aggressive_bypass_used = True
+                self._emit_strategy_entry_skip(
+                    SkipReason(
+                        code=SkipCodes.AGGRESSIVE_SMA_BYPASS,
+                        message=(
+                            "aggressive_mode_bypassed_sma_filter "
+                            f"rsi={last_rsi:.4f} threshold={aggressive_bypass_threshold:.4f}"
+                        ),
+                        symbol=symbol,
+                        decision="PASS",
+                        rsi=last_rsi,
+                        atr=last_atr,
+                        adx=float(regime_eff.adx),
+                        price=last_close,
+                        sma_200=float(regime_eff.sma200),
+                        sma_200_slope=float(regime_eff.sma_slope),
+                        spread_pct=sp_live,
+                        quote_age_seconds=qa_live,
+                        strategy_bar_ts=bar_ts,
+                        metadata={
+                            **dict(common_meta),
+                            "sma_filter_passed": False,
+                            "aggressive_sma_bypassed": True,
+                            "adx_fail": adx_fail,
+                            "sma_slope_fail": slope_fail,
+                        },
+                    ),
+                    log_event="strategy_aggressive_sma_bypass",
+                    discord_title="AGGRESSIVE_SMA_BYPASS",
+                )
+            else:
+                self._log_regime_skip(
+                    symbol=symbol,
+                    reason=regime_eff.reason,
+                    regime=regime_eff,
+                    rsi_value=last_rsi,
+                    atr_value=last_atr,
+                    quote=ctx.quote,
+                    last_close=last_close,
+                    bar_ts=bar_ts,
+                    extra_meta={
+                        **dict(common_meta),
+                        "sma_filter_passed": False,
+                        "aggressive_sma_bypassed": False,
+                        "aggressive_bypass_candidate": aggressive_bypass_candidate,
+                    },
+                )
+                return signals
         overlay_live = ctx.sentiment_overlay or sentiment_overlay_neutral(symbol)
         if overlay_live.get("sentiment_blocks_long_entries") or overlay_live.get(
             "sentiment_label"
@@ -658,6 +937,7 @@ class RSIMeanReversionStrategy(Strategy):
                 symbol=symbol,
                 overlay=overlay_live,
                 rsi_value=last_rsi,
+                common_meta=common_meta,
             )
             return signals
 
@@ -668,7 +948,12 @@ class RSIMeanReversionStrategy(Strategy):
         )
 
         md = self._regime_overlay(
-            base_meta(),
+            {
+                **base_meta(),
+                **common_meta,
+                "sma_filter_passed": True,
+                "aggressive_sma_bypassed": aggressive_bypass_used,
+            },
             regime_eff,
             trailing={
                 "trailing_stop_active": False,
@@ -685,32 +970,29 @@ class RSIMeanReversionStrategy(Strategy):
             ctx_ml["symbol"] = symbol
             dec = self._ml_filter.should_allow_trade(signal_context=ctx_ml)
             if not dec.allowed:
-                ts = datetime.now(UTC).isoformat()
-                self._log.info(
-                    "event=strategy_skip_ml symbol=%s ml_filter_enabled=true ml_model_trained=%s "
-                    "ml_probability=%s ml_threshold=%s ml_decision=skip ml_reason=%s timestamp=%s",
-                    symbol,
-                    str(dec.model_trained).lower(),
-                    "n/a" if dec.probability is None else f"{dec.probability:.6f}",
-                    float(self._settings.ML_FILTER_THRESHOLD),
-                    dec.reason,
-                    ts,
-                    extra={"symbol": symbol, "strategy": self.name},
+                prob_txt = "n/a" if dec.probability is None else f"{dec.probability:.6f}"
+                sr_ml = SkipReason(
+                    code=SkipCodes.RISK_LIMIT_FAIL,
+                    message=str(dec.reason or "ml_filter_disallowed"),
+                    symbol=symbol,
+                    rsi=last_rsi,
+                    atr=last_atr,
+                    price=last_close,
+                    spread_pct=sp_live,
+                    quote_age_seconds=qa_live,
+                    strategy_bar_ts=bar_ts,
+                    metadata={
+                        **dict(common_meta),
+                        "ml_model_trained": dec.model_trained,
+                        "ml_probability": prob_txt,
+                        "ml_threshold": float(self._settings.ML_FILTER_THRESHOLD),
+                    },
                 )
-                if self._discord_embed_fn is not None:
-                    prob_txt = "n/a" if dec.probability is None else f"{dec.probability:.4f}"
-                    self._discord_embed_fn(
-                        {
-                            "title": "ML_TRADE_BLOCKED",
-                            "lines": [
-                                f"symbol={symbol}",
-                                f"probability={prob_txt}",
-                                f"threshold={float(self._settings.ML_FILTER_THRESHOLD):.4f}",
-                                "reason=model_below_threshold",
-                            ],
-                            "color": 0x95A5A6,
-                        },
-                    )
+                self._emit_strategy_entry_skip(
+                    sr_ml,
+                    log_event="strategy_skip_ml",
+                    discord_title="ML_ENTRY_SKIP",
+                )
                 return signals
 
         signal = Signal(

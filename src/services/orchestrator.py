@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,12 @@ from risk.position_sizer import PositionSizer
 from strategies.base import Signal, SignalAction, StrategyContext
 from strategies.ml_filter import MLSignalFilter
 from strategies.rsi_mean_reversion import RSIMeanReversionStrategy
+from strategies.skip_diagnostics import (
+    SkipCodes,
+    SkipDiagnosticsThrottle,
+    SkipReason,
+    emit_skip_diagnostic,
+)
 from strategies.scanner import (
     load_scan_record,
     maybe_refresh_after_open,
@@ -96,6 +103,14 @@ from utils.time_utils import now_eastern, now_utc, today_eastern
 from .autotune import iso_week_token, run_autotune_job
 from .heartbeat import HeartbeatService
 from .reporter import generate_daily_report
+
+_TIMEFRAME_SECONDS: dict[str, float] = {
+    "1Min": 60.0,
+    "5Min": 300.0,
+    "15Min": 900.0,
+    "1Hour": 3600.0,
+    "1Day": 86400.0,
+}
 
 
 class Orchestrator:
@@ -144,6 +159,12 @@ class Orchestrator:
         self._kill_switch = KillSwitch(self._state, drawdown_pct=settings.KILL_SWITCH_DRAWDOWN_PCT)
         self._exposure = ExposureChecker(settings)
         self._sizer = PositionSizer(settings, self._compliance, self._exposure, database=self._database)
+        self._discord_out: asyncio.Queue[dict[str, Any]] | None = (
+            asyncio.Queue(maxsize=64) if settings.ENABLE_DISCORD_BOT else None
+        )
+        self._discord_task: asyncio.Task[Any] | None = None
+        self._orchestrator_skip_throttle = SkipDiagnosticsThrottle()
+        self._universe_skip_throttle = SkipDiagnosticsThrottle()
         self._strategy = RSIMeanReversionStrategy(
             settings,
             state_store=self._state,
@@ -156,7 +177,16 @@ class Orchestrator:
                 else None
             ),
         )
-        self._universe = UniverseFilter(settings, strategy_name=self._strategy.name)
+        self._universe = UniverseFilter(
+            settings,
+            strategy_name=self._strategy.name,
+            discord_enqueue=(
+                (lambda spec, orch=self: enqueue_discord_alert(orch._discord_out, spec))
+                if settings.ENABLE_DISCORD_BOT
+                else None
+            ),
+            skip_throttle=self._universe_skip_throttle,
+        )
         self._order_service: OrderService | None = None
         self._heartbeat: HeartbeatService | None = None
 
@@ -168,10 +198,6 @@ class Orchestrator:
         self._scanned_symbols: list[str] = []
         self._stream_symbol_list: list[str] = []
         self._corr_cache: dict[str, tuple[float, str | None]] = {}
-        self._discord_out: asyncio.Queue[dict[str, Any]] | None = (
-            asyncio.Queue(maxsize=64) if settings.ENABLE_DISCORD_BOT else None
-        )
-        self._discord_task: asyncio.Task[Any] | None = None
         self._phase8_ml_last_et_day: str | None = None
         self._phase8_autotune_last_et_week: str | None = None
         self._stream_bad_ticks_consec: int = 0
@@ -454,6 +480,7 @@ class Orchestrator:
 
         # Seed quote cache with latest REST quotes (may be replaced by ws later)
         self._seed_quotes(self._stream_symbol_list)
+        self._warn_unbuyable_symbols_under_cap()
 
         # Build streams
         self._stream_runner = TradingStreamRunner(
@@ -820,11 +847,66 @@ class Orchestrator:
                 )
                 continue
             self._warmup_symbol_if_needed(sym)
+            bars = self._refresh_symbol_bars(sym)
             quote = self._quote_cache.get(sym)
             if quote is None or not quote.is_fresh(self._settings.QUOTE_STALENESS_SECONDS):
                 quote = self._rest_quote(sym)
 
-            bars = self._bars_cache.get(sym, pd.DataFrame())
+            now_eval = now_utc()
+            latest_bar_ts = self._latest_bar_timestamp(bars)
+            bar_age_s = self._bar_age_seconds(bars, now_eval)
+            max_bar_age_s = self._max_allowed_bar_age_seconds()
+            live_ts = quote.timestamp if quote is not None else None
+            if bars is None or bars.empty:
+                sector = self._settings.sector_for_symbol(sym)
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.MISSING_BARS,
+                        message="strategy_bars_missing_for_symbol",
+                        symbol=sym,
+                        strategy_bar_ts=None,
+                        dashboard_bar_ts=live_ts,
+                        metadata={
+                            "decision_fn": "Orchestrator._tick",
+                            "sector": sector,
+                            "bar_rows": 0,
+                            "max_bar_age_seconds": max_bar_age_s,
+                        },
+                    ),
+                )
+                if sym not in positions_by_symbol:
+                    continue
+            if bar_age_s is None or bar_age_s > max_bar_age_s:
+                sector = self._settings.sector_for_symbol(sym)
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.STALE_BARS,
+                        message="STALE_BARS: latest strategy bar is older than allowed threshold",
+                        symbol=sym,
+                        strategy_bar_ts=latest_bar_ts,
+                        dashboard_bar_ts=live_ts,
+                        metadata={
+                            "decision_fn": "Orchestrator._tick",
+                            "sector": sector,
+                            "bar_rows": len(bars),
+                            "bar_age_seconds": bar_age_s,
+                            "max_bar_age_seconds": max_bar_age_s,
+                        },
+                    ),
+                )
+                if sym not in positions_by_symbol:
+                    continue
+            self._log_strategy.info(
+                "event=strategy_bar_freshness symbol=%s latest_bar_ts=%s strategy_ts=%s "
+                "live_quote_ts=%s bar_age_seconds=%.3f bar_rows=%s",
+                sym,
+                latest_bar_ts.isoformat() if latest_bar_ts is not None else "n_a",
+                now_eval.isoformat(),
+                live_ts.isoformat() if live_ts is not None else "n_a",
+                float(bar_age_s),
+                len(bars),
+                extra={"symbol": sym},
+            )
 
             elig = self._universe.is_eligible(
                 sym,
@@ -845,7 +927,7 @@ class Orchestrator:
                 account=self._latest_account,
                 positions_by_symbol=positions_by_symbol,
                 open_order_symbols=open_order_symbols,
-                now_utc=now_utc(),
+                now_utc=now_eval,
                 feed=self._quote_cache.feed,
                 sentiment_overlay=overlay,
                 anti_martingale_risk_mode=t_mode.value,
@@ -862,6 +944,7 @@ class Orchestrator:
                     compliance_allow=compliance_decision.allow_new_entries,
                     eligible=elig.eligible,
                     eligibility_reason=elig.reason,
+                    eligibility_code=elig.code,
                     bot_managed_notional=bot_managed_notional,
                 )
 
@@ -1012,6 +1095,36 @@ class Orchestrator:
 
     # ------------------------------------------------------------ signals
 
+    def _emit_orchestrator_enter_skip(self, sr: SkipReason) -> None:
+        if "decision_fn" not in sr.metadata:
+            sr = replace(
+                sr,
+                metadata={"decision_fn": "Orchestrator._handle_signal", **dict(sr.metadata)},
+            )
+        actionable_for_discord = {
+            SkipCodes.SIZE_ZERO,
+            SkipCodes.STALE_BARS,
+            SkipCodes.SPREAD_TOO_WIDE,
+            SkipCodes.ORDER_REJECTED,
+            SkipCodes.RISK_LIMIT_FAIL,
+            SkipCodes.SECTOR_LIMIT_FAIL,
+        }
+        discord_sink = (
+            (lambda spec, o=self: enqueue_discord_alert(o._discord_out, spec))
+            if sr.code in actionable_for_discord
+            else None
+        )
+        emit_skip_diagnostic(
+            settings=self._settings,
+            logger=self._log_strategy,
+            log_event="orchestrator_entry_skip",
+            sr=sr,
+            discord_enqueue=discord_sink,
+            throttle=self._orchestrator_skip_throttle,
+            phase="orchestrator",
+            discord_title="ENTER_BLOCKED",
+        )
+
     async def _handle_signal(
         self,
         signal: Signal,
@@ -1023,6 +1136,7 @@ class Orchestrator:
         eligible: bool,
         eligibility_reason: str,
         bot_managed_notional: float,
+        eligibility_code: str = "ok",
     ) -> None:
         sym = signal.symbol
         coid_extra = {"symbol": sym, "strategy": self._strategy.name}
@@ -1031,28 +1145,92 @@ class Orchestrator:
             return
 
         if signal.action == SignalAction.ENTER_LONG:
+            sector = self._settings.sector_for_symbol(sym)
             if self._kill_switch.is_latched():
-                self._log_strategy.info(
-                    "ENTER skipped (kill switch latched) %s", sym, extra=coid_extra,
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.KILL_SWITCH_LATCHED,
+                        message="kill_switch_latched blocks_new_long_entries",
+                        symbol=sym,
+                        metadata={"sector": sector},
+                    ),
                 )
                 return
             if not can_open:
-                self._log_strategy.info("ENTER skipped (window closed) %s", sym, extra=coid_extra)
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.MARKET_CLOSED,
+                        message="market_or_bot_window_closed_for_new_entries",
+                        symbol=sym,
+                        metadata={"sector": sector},
+                    ),
+                )
                 return
             if not compliance_allow:
-                self._log_strategy.info("ENTER skipped (compliance) %s", sym, extra=coid_extra)
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.RISK_LIMIT_FAIL,
+                        message="compliance_adapter_disallows_new_entries_this_session",
+                        symbol=sym,
+                        metadata={"risk_gate": "compliance", "sector": sector},
+                    ),
+                )
                 return
             if not eligible:
-                self._log_strategy.info(
-                    "ENTER skipped (universe: %s) %s",
-                    eligibility_reason, sym, extra=coid_extra,
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.UNIVERSE_INELIGIBLE,
+                        message=f"universe_gate detail={eligibility_reason}",
+                        symbol=sym,
+                        metadata={
+                            "eligibility_reason": eligibility_reason,
+                            "eligibility_code": eligibility_code,
+                            "sector": sector,
+                        },
+                    ),
                 )
                 return
             if quote is None:
-                self._log_strategy.info("ENTER skipped (no quote) %s", sym, extra=coid_extra)
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.QUOTE_INVALID,
+                        message="no_quote_at_execution_layer after_strategy_emitted_enter",
+                        symbol=sym,
+                        metadata={"sector": sector},
+                    ),
+                )
                 return
             if not self._stream_health.all_ok:
-                self._log_strategy.info("ENTER skipped (stream unhealthy) %s", sym, extra=coid_extra)
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.STREAM_UNHEALTHY,
+                        message="quote_or_stream_health_gate_failed",
+                        symbol=sym,
+                        metadata={"stream_all_ok": False, "sector": sector},
+                    ),
+                )
+                return
+
+            max_per_sector = int(self._settings.MAX_OPEN_POSITIONS_PER_SECTOR)
+            open_in_sector = self._open_sector_symbols(sector)
+            if len(open_in_sector) >= max_per_sector:
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.SECTOR_LIMIT_FAIL,
+                        message=(
+                            "sector_limit_reached blocks_new_entry "
+                            f"sector={sector} open={len(open_in_sector)} "
+                            f"max={max_per_sector}"
+                        ),
+                        symbol=sym,
+                        metadata={
+                            "sector": sector,
+                            "open_in_sector": len(open_in_sector),
+                            "max_open_positions_per_sector": max_per_sector,
+                            "current_positions_in_sector": ",".join(open_in_sector),
+                        },
+                    ),
+                )
                 return
 
             corr_block = self._maybe_correlation_block(sym)
@@ -1077,15 +1255,76 @@ class Orchestrator:
                 risk_mode=am_mode.value,
                 recent_trade_hint=am_preview,
             )
-            if sizing.shares < 1:
-                self._log_strategy.info(
-                    "ENTER size=0 reason=%s %s", sizing.skipped_reason or sizing.rationale, sym,
-                    extra=coid_extra,
+            min_shares = float(self._settings.MIN_SHARES)
+            if sizing.shares < min_shares:
+                sm = getattr(signal, "metadata", {}) or {}
+
+                def _fmeta(v: object) -> float | None:
+                    try:
+                        if v is None:
+                            return None
+                        x = float(v)
+                        return x if x == x else None
+                    except (TypeError, ValueError):
+                        return None
+
+                lc = _fmeta(sm.get("last_close")) or _fmeta(signal.reference_price)
+                is_corr = bool(corr_block) or (
+                    sizing.skipped_reason is not None
+                    and "correlation" in str(sizing.skipped_reason).lower()
+                )
+                sk_code = SkipCodes.RISK_LIMIT_FAIL if is_corr else SkipCodes.SIZE_ZERO
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=sk_code,
+                        message=(
+                            "cannot_allocate_positive_share_count "
+                            f"skipped_reason={str(sizing.skipped_reason)} "
+                            f"rationale={str(sizing.rationale)}"[:480]
+                        ),
+                        symbol=sym,
+                        rsi=_fmeta(sm.get("rsi")),
+                        price=lc,
+                        sma_200=_fmeta(sm.get("sma200")),
+                        sma_200_slope=_fmeta(sm.get("sma_slope")),
+                        adx=_fmeta(sm.get("adx")),
+                        atr=_fmeta(sm.get("atr")),
+                        bid=float(quote.bid) if quote is not None else None,
+                        ask=float(quote.ask) if quote is not None else None,
+                        spread_pct=_fmeta(sm.get("spread_pct")),
+                        quote_age_seconds=float(quote.age_seconds()) if quote is not None else None,
+                        risk_qty=float(sizing.shares),
+                        metadata={
+                            "correlation_block": corr_block or "",
+                            "sizer_skipped_reason": sizing.skipped_reason or "",
+                            "sizer_rationale": sizing.rationale or "",
+                            "risk_mode": sizing.risk_mode,
+                            "conviction_risk_multiplier": conv_mult,
+                            "max_dollars_per_trade": float(self._settings.max_dollars_per_trade),
+                            "raw_shares": sizing.risk_budget / sizing.stop_distance
+                            if sizing.stop_distance > 0
+                            else 0.0,
+                            "final_shares": float(sizing.shares),
+                            "fractional_enabled": str(self._settings.ENABLE_FRACTIONAL).lower(),
+                            "sector": sector,
+                            "open_in_sector": len(open_in_sector),
+                            "max_open_positions_per_sector": max_per_sector,
+                        },
+                    ),
                 )
                 return
 
             sym_u = sym.upper()
             meta = getattr(signal, "metadata", {}) or {}
+            def _meta_float(v: object) -> float | None:
+                try:
+                    if v is None:
+                        return None
+                    x = float(v)
+                    return x if x == x else None
+                except (TypeError, ValueError):
+                    return None
+
             audit = {
                 "opened_at": datetime.now(UTC).isoformat(),
                 "entry_price": float(signal.reference_price or quote.bid),
@@ -1096,9 +1335,16 @@ class Orchestrator:
                 "rsi": meta.get("rsi"),
                 "adx": meta.get("adx"),
                 "atr": meta.get("atr"),
+                "atr_pct": meta.get("atr_pct"),
                 "spread_pct": meta.get("spread_pct"),
                 "price_above_sma200": meta.get("price_above_sma200"),
                 "last_close": meta.get("last_close"),
+                "volatility_tier": meta.get("volatility_tier"),
+                "rsi_threshold_used": meta.get("rsi_threshold_used"),
+                "sma_filter_passed": meta.get("sma_filter_passed"),
+                "aggressive_sma_bypassed": meta.get("aggressive_sma_bypassed"),
+                "sector": meta.get("sector") or sector,
+                "open_in_sector": len(open_in_sector),
             }
             audit = {k: v for k, v in audit.items() if v is not None}
             self._entry_audit[sym_u] = audit
@@ -1123,20 +1369,56 @@ class Orchestrator:
                     )
             except OrderPlacementError as exc:
                 self._entry_audit.pop(sym_u, None)
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.ORDER_REJECTED,
+                        message=f"order_service_rejected_entry: {exc}",
+                        symbol=sym_u,
+                        rsi=_meta_float(meta.get("rsi")),
+                        adx=_meta_float(meta.get("adx")),
+                        atr=_meta_float(meta.get("atr")),
+                        price=float(signal.reference_price or quote.bid),
+                        sma_200=_meta_float(meta.get("sma200")),
+                        bid=float(quote.bid) if quote is not None else None,
+                        ask=float(quote.ask) if quote is not None else None,
+                        spread_pct=_meta_float(meta.get("spread_pct")),
+                        risk_qty=float(sizing.shares),
+                        metadata={
+                            "max_dollars_per_trade": float(self._settings.max_dollars_per_trade),
+                            "fractional_enabled": str(self._settings.ENABLE_FRACTIONAL).lower(),
+                            "sector": sector,
+                            "open_in_sector": len(open_in_sector),
+                            "max_open_positions_per_sector": max_per_sector,
+                        },
+                    ),
+                )
                 self._log.error("Entry placement error %s: %s", sym, exc, extra=coid_extra)
                 return
             if wo is None:
                 self._entry_audit.pop(sym_u, None)
+                self._emit_orchestrator_enter_skip(
+                    SkipReason(
+                        code=SkipCodes.UNKNOWN_SKIP,
+                        message="order_service_returned_none_without_exception",
+                        symbol=sym_u,
+                    ),
+                )
             elif str(wo.status).lower() != "dry_run":
                 risk_pct_hint = sizing.effective_risk_pct
                 base_lines = [
                     f"symbol={sym_u}",
+                    f"sector={audit.get('sector','Unknown')}",
                     f"qty={int(sizing.shares)} price={audit.get('entry_price')}",
                     f"risk_pct_eff={risk_pct_hint:.6f}",
                     f"regime={audit.get('regime_type','')}",
                     f"sentiment={audit.get('sentiment_score','')}",
                     f"rsi={audit.get('rsi','')}",
                     f"adx={audit.get('adx','')}",
+                    f"atr_pct={audit.get('atr_pct','')}",
+                    f"vol_tier={audit.get('volatility_tier','')}",
+                    f"rsi_thr={audit.get('rsi_threshold_used','')}",
+                    f"sma_bypass={audit.get('aggressive_sma_bypassed','')}",
+                    f"open_in_sector={audit.get('open_in_sector','')}",
                     f"spread_pct={audit.get('spread_pct','')}",
                     f"source={'paper' if self._settings.ALPACA_ENV=='paper' else 'live'}",
                 ]
@@ -1148,6 +1430,31 @@ class Orchestrator:
                         "color": 0x2ECC71,
                     },
                 )
+            self._log_strategy.info(
+                "event=trade_decision decision=%s symbol=%s reason=entry_submitted sector=%s qty=%s "
+                "rsi=%s adx=%s atr_pct=%s volatility_tier=%s rsi_threshold=%s "
+                "price=%s sma200=%s sma_filter_passed=%s aggressive_sma_bypassed=%s "
+                "open_in_sector=%s bid=%s ask=%s spread_pct=%s latest_bar_ts=%s",
+                "ORDER_SUBMITTED" if wo is not None else "SKIP",
+                sym_u,
+                str(audit.get("sector", sector)),
+                int(sizing.shares),
+                str(audit.get("rsi", "n_a")),
+                str(audit.get("adx", "n_a")),
+                str(audit.get("atr_pct", "n_a")),
+                str(audit.get("volatility_tier", "n_a")),
+                str(audit.get("rsi_threshold_used", "n_a")),
+                str(audit.get("entry_price", "n_a")),
+                str(meta.get("sma200", "n_a")),
+                str(audit.get("sma_filter_passed", "n_a")),
+                str(audit.get("aggressive_sma_bypassed", "n_a")),
+                str(audit.get("open_in_sector", "n_a")),
+                f"{quote.bid:.6f}" if quote is not None else "n_a",
+                f"{quote.ask:.6f}" if quote is not None else "n_a",
+                str(audit.get("spread_pct", "n_a")),
+                str(meta.get("bar_timestamp", "n_a")),
+                extra={"symbol": sym_u},
+            )
             return
 
         if signal.action == SignalAction.EXIT_LONG:
@@ -1202,6 +1509,17 @@ class Orchestrator:
 
     # ------------------------------------------------------------ helpers
 
+    def _open_sector_symbols(self, sector: str) -> list[str]:
+        target = str(sector or "Unknown")
+        out: list[str] = []
+        for p in list(self._latest_positions or []):
+            if str(p.side).lower() != "long":
+                continue
+            sym = str(p.symbol).upper()
+            if self._settings.sector_for_symbol(sym) == target:
+                out.append(sym)
+        return out
+
     def _position_for(self, symbol: str) -> PositionSnapshot | None:
         sym = symbol.upper()
         for p in self._latest_positions:
@@ -1219,14 +1537,9 @@ class Orchestrator:
 
     def _warmup_bars(self, symbols: list[str] | None = None) -> None:
         syms = symbols if symbols is not None else (self._stream_symbol_list or self._settings.symbols_list)
-        lookback = self._strategy.warmup_lookback()
         for sym in syms:
             try:
-                df = self._bar_fetcher.fetch_bars(
-                    sym,
-                    self._settings.BAR_TIMEFRAME,
-                    lookback_bars=lookback,
-                )
+                df = self._fetch_symbol_bars(sym)
                 self._bars_cache[sym] = df
                 self._log.info("Warmup bars %s rows=%d", sym, len(df))
             except Exception as exc:  # noqa: BLE001
@@ -1246,17 +1559,103 @@ class Orchestrator:
         sym = symbol.upper()
         if sym in self._bars_cache and not self._bars_cache[sym].empty:
             return
+        self._refresh_symbol_bars(sym, force=True)
+
+    def _fetch_symbol_bars(self, symbol: str) -> pd.DataFrame:
         lookback = self._strategy.warmup_lookback()
+        return self._bar_fetcher.fetch_bars(
+            symbol.upper(),
+            self._settings.BAR_TIMEFRAME,
+            lookback_bars=lookback,
+        )
+
+    def _refresh_symbol_bars(self, symbol: str, *, force: bool = False) -> pd.DataFrame:
+        sym = symbol.upper()
+        current = self._bars_cache.get(sym, pd.DataFrame())
         try:
-            df = self._bar_fetcher.fetch_bars(
-                sym,
-                self._settings.BAR_TIMEFRAME,
-                lookback_bars=lookback,
-            )
+            df = self._fetch_symbol_bars(sym)
             self._bars_cache[sym] = df
+            return df
         except Exception as exc:  # noqa: BLE001
-            self._log.warning("Incremental warmup failed %s: %s", sym, exc)
+            if force:
+                self._log.warning("Incremental warmup failed %s: %s", sym, exc)
+            else:
+                self._log.warning("Bar refresh failed %s: %s", sym, exc)
+            if current is not None:
+                self._bars_cache[sym] = current
+                return current
             self._bars_cache[sym] = pd.DataFrame()
+            return self._bars_cache[sym]
+
+    def _latest_bar_timestamp(self, bars: pd.DataFrame) -> datetime | None:
+        if bars is None or bars.empty:
+            return None
+        try:
+            ts = bars.index[-1]
+            if hasattr(ts, "to_pydatetime"):
+                dt = ts.to_pydatetime()
+            elif isinstance(ts, datetime):
+                dt = ts
+            else:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return dt
+        except (IndexError, AttributeError, TypeError, ValueError):
+            return None
+
+    def _bar_age_seconds(self, bars: pd.DataFrame, now_ts: datetime) -> float | None:
+        latest_ts = self._latest_bar_timestamp(bars)
+        if latest_ts is None:
+            return None
+        return max(0.0, float((now_ts - latest_ts).total_seconds()))
+
+    def _max_allowed_bar_age_seconds(self) -> float:
+        tf = float(_TIMEFRAME_SECONDS.get(self._settings.BAR_TIMEFRAME, 300.0))
+        cfg = float(self._settings.MAX_STRATEGY_BAR_AGE_SECONDS)
+        return max(cfg, tf * 1.5)
+
+    def _warn_unbuyable_symbols_under_cap(self) -> None:
+        if bool(self._settings.ENABLE_FRACTIONAL):
+            return
+        cap = float(self._settings.max_dollars_per_trade)
+        offenders: list[str] = []
+        for sym in list(self._stream_symbol_list or self._settings.symbols_list):
+            sym_u = sym.upper()
+            px: float | None = None
+            qq = self._quote_cache.get(sym_u) if self._quote_cache is not None else None
+            if qq is not None and qq.bid > 0 and qq.ask > qq.bid:
+                px = (float(qq.bid) + float(qq.ask)) / 2.0
+            if px is None:
+                bars = self._bars_cache.get(sym_u, pd.DataFrame())
+                if bars is not None and not bars.empty:
+                    with contextlib.suppress(Exception):
+                        px = float(bars["close"].iloc[-1])
+            if px is None or px <= 0:
+                continue
+            if px > cap:
+                offenders.append(f"{sym_u}@{px:.2f}")
+        if not offenders:
+            return
+        msg = (
+            "event=sizing_preflight_warning code=SIZE_ZERO "
+            "fractional_enabled=false "
+            f"max_dollars_per_trade={cap:.2f} "
+            f"symbols_above_cap={','.join(offenders[:20])}"
+        )
+        self._log_risk.warning(msg)
+        enqueue_discord_alert(
+            self._discord_out,
+            {
+                "title": "SIZING_PRECHECK_WARNING",
+                "lines": [
+                    "Fractional trading is disabled and some symbols are above allocation cap.",
+                    f"max_dollars_per_trade={cap:.2f}",
+                    f"symbols={','.join(offenders[:12])}",
+                ],
+                "color": 0xF39C12,
+            },
+        )
 
     def _rest_quote(self, symbol: str) -> Quote | None:
         try:

@@ -7,9 +7,10 @@ configuration validation happens in exactly one place.
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -74,6 +75,11 @@ class Settings(BaseSettings):
     RSI_LENGTH: int = Field(14, ge=2, le=200)
     RSI_OVERSOLD: float = Field(30.0, ge=1.0, le=99.0)
     RSI_EXIT: float = Field(50.0, ge=1.0, le=99.0)
+    DEFAULT_RSI_ENTRY: float = Field(30.0, ge=1.0, le=99.0)
+    HIGH_VOL_RSI_ENTRY: float = Field(35.0, ge=1.0, le=99.0)
+    HIGH_VOL_ATR_PCT_THRESHOLD: float = Field(0.05, gt=0.0, le=1.0)
+    AGGRESSIVE_MODE: bool = False
+    AGGRESSIVE_RSI_BYPASS_THRESHOLD: float = Field(20.0, ge=1.0, le=99.0)
     ATR_LENGTH: int = Field(14, ge=2, le=200)
     ATR_STOP_MULTIPLIER: float = Field(2.0, gt=0.0, le=20.0)
     ATR_PROFIT_MULTIPLIER: float = Field(3.0, gt=0.0, le=50.0)
@@ -95,9 +101,17 @@ class Settings(BaseSettings):
     # ---- Risk ----------------------------------------------------------------------
     MAX_RISK_PER_TRADE_PCT: float = Field(0.01, gt=0.0, le=0.05)
     MAX_EQUITY_USAGE_USD: float = Field(50.0, gt=0.0)
+    # Optional alias: when set (>0), this overrides MAX_EQUITY_USAGE_USD.
+    MAX_DOLLARS_PER_TRADE: float = Field(0.0, ge=0.0)
     MAX_GROSS_EXPOSURE_PCT: float = Field(0.5, gt=0.0, le=2.0)
     MAX_OPEN_POSITIONS: int = Field(1, ge=1, le=100)
+    MAX_OPEN_POSITIONS_PER_SECTOR: int = Field(2, ge=1, le=100)
     KILL_SWITCH_DRAWDOWN_PCT: float = Field(0.05, gt=0.0, le=0.5)
+    # JSON object string: {"AAPL":"Technology","MSFT":"Technology",...}
+    SECTOR_MAP_JSON: str = (
+        '{"AAPL":"Technology","MSFT":"Technology","NVDA":"Technology",'
+        '"SHOP":"Technology","ABNB":"Consumer Cyclical","MARA":"Crypto / Digital Assets"}'
+    )
 
     # The dollar capital base the bot is allocated. When >0 this overrides
     # full account equity for risk-budget computation, so the bot only risks
@@ -108,7 +122,21 @@ class Settings(BaseSettings):
 
     # ---- Quote / execution filters -------------------------------------------------
     SPREAD_FILTER_PCT: float = Field(0.0005, gt=0.0, le=0.05)
+    # Optional wider cap for quotes tagged ``feed=iex`` (IEX top-of-book is often
+    # wider than SIP). When unset (default), all feeds use SPREAD_FILTER_PCT.
+    SPREAD_FILTER_PCT_IEX: Optional[float] = Field(default=None)
+    SPREAD_FILTER_ELASTIC_ENABLED: bool = True
+    # Absolute hard cap after all elasticity multipliers are applied.
+    SPREAD_FILTER_MAX_PCT: float = Field(0.02, gt=0.0, le=0.25)
+    SPREAD_FILTER_IEX_ELASTIC_MULTIPLIER: float = Field(1.75, ge=1.0, le=10.0)
+    SPREAD_FILTER_LOW_PRICE_THRESHOLD: float = Field(25.0, gt=0.0, le=5000.0)
+    SPREAD_FILTER_LOW_PRICE_MULTIPLIER: float = Field(1.5, ge=1.0, le=10.0)
+    SPREAD_FILTER_SPARSE_SIZE_THRESHOLD: float = Field(5.0, ge=0.0, le=100000.0)
+    SPREAD_FILTER_SPARSE_QUOTE_MULTIPLIER: float = Field(1.25, ge=1.0, le=10.0)
+    SPREAD_FILTER_FRESH_QUOTE_MULTIPLIER: float = Field(1.15, ge=1.0, le=10.0)
+    SPREAD_FILTER_FRESH_AGE_FRACTION: float = Field(0.5, gt=0.0, le=1.0)
     QUOTE_STALENESS_SECONDS: float = Field(5.0, gt=0.0, le=300.0)
+    MAX_STRATEGY_BAR_AGE_SECONDS: float = Field(900.0, ge=30.0, le=86_400.0)
     ORDER_TIMEOUT_SECONDS: float = Field(30.0, gt=0.0, le=3600.0)
     EMERGENCY_AGGRESSIVENESS_PCT: float = Field(0.0015, gt=0.0, le=0.05)
 
@@ -127,6 +155,9 @@ class Settings(BaseSettings):
 
     # ---- Optional features ---------------------------------------------------------
     ENABLE_FRACTIONAL: bool = False
+    # Optional alias. When set, this overrides ENABLE_FRACTIONAL.
+    FRACTIONAL_TRADING_ENABLED: Optional[bool] = None
+    MIN_SHARES: float = Field(1.0, gt=0.0, le=100.0)
 
     # ---- Live canary check (one-time per day, before main loop) --------------------
     # The canary verifies credentials, order submission, fills, reconciliation,
@@ -212,6 +243,15 @@ class Settings(BaseSettings):
     DISCORD_CHANNEL_ID: str = ""
     DISCORD_ALLOWED_USER_IDS: str = ""
     DISCORD_COMMAND_RATE_LIMIT_SECONDS: float = Field(5.0, ge=1.0, le=3600.0)
+
+    # Entry-skip diagnostics: cooldown for Discord + optional log throttling for repetitive reasons.
+    SKIP_DIAGNOSTICS_DISCORD_COOLDOWN_SECONDS: float = Field(45.0, ge=0.0, le=86400.0)
+    SKIP_DIAGNOSTICS_NOISY_LOG_THROTTLE_SECONDS: float = Field(
+        120.0, ge=0.0, le=86400.0
+    )
+    SKIP_DIAGNOSTICS_UNIVERSE_LOG_THROTTLE_SECONDS: float = Field(
+        45.0, ge=0.0, le=86400.0
+    )
 
     ENABLE_KELLY_SIZING: bool = False
     KELLY_LOOKBACK_TRADES: int = Field(100, ge=5, le=50_000)
@@ -309,6 +349,44 @@ class Settings(BaseSettings):
             raise ValueError(f"CANARY_PERSIST_FILENAME must be a bare filename: {name!r}")
         return name
 
+    @field_validator("SPREAD_FILTER_PCT_IEX", mode="before")
+    @classmethod
+    def _coerce_empty_spread_iex(cls, value: object) -> object:
+        if value in {"", None}:
+            return None
+        return value
+
+    @field_validator("SECTOR_MAP_JSON")
+    @classmethod
+    def _validate_sector_map_json(cls, value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return "{}"
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"SECTOR_MAP_JSON must be valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("SECTOR_MAP_JSON must decode to an object/dict")
+        normalized: dict[str, str] = {}
+        for k, v in parsed.items():
+            ks = str(k).strip().upper()
+            vs = str(v).strip()
+            if not ks or not vs:
+                continue
+            normalized[ks] = vs
+        return json.dumps(normalized, separators=(",", ":"))
+
+    @field_validator("SPREAD_FILTER_PCT_IEX")
+    @classmethod
+    def _validate_spread_iex(cls, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        x = float(value)
+        if x <= 0.0 or x > 0.05:
+            raise ValueError("SPREAD_FILTER_PCT_IEX must satisfy 0 < value <= 0.05 (or be empty / unset).")
+        return x
+
     @field_validator("CORRELATION_LEADER_SYMBOL", "BLACK_SWAN_SYMBOL")
     @classmethod
     def _validate_phase3_leader_symbols(cls, v: str) -> str:
@@ -332,6 +410,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_consistency(self) -> "Settings":
+        if self.MAX_DOLLARS_PER_TRADE > 0:
+            self.MAX_EQUITY_USAGE_USD = float(self.MAX_DOLLARS_PER_TRADE)
+        if self.FRACTIONAL_TRADING_ENABLED is not None:
+            self.ENABLE_FRACTIONAL = bool(self.FRACTIONAL_TRADING_ENABLED)
         # Live trading requires explicit confirmation phrase.
         if (
             self.ALPACA_ENV == ALPACA_ENV_LIVE
@@ -348,6 +430,12 @@ class Settings(BaseSettings):
                 "RSI_OVERSOLD must be strictly less than RSI_EXIT for "
                 "a mean-reversion long strategy."
             )
+        if self.DEFAULT_RSI_ENTRY >= self.RSI_EXIT:
+            raise ValueError("DEFAULT_RSI_ENTRY must be strictly less than RSI_EXIT.")
+        if self.HIGH_VOL_RSI_ENTRY >= self.RSI_EXIT:
+            raise ValueError("HIGH_VOL_RSI_ENTRY must be strictly less than RSI_EXIT.")
+        if self.AGGRESSIVE_RSI_BYPASS_THRESHOLD >= self.RSI_EXIT:
+            raise ValueError("AGGRESSIVE_RSI_BYPASS_THRESHOLD must be < RSI_EXIT.")
         # Retry bounds
         if self.RETRY_BASE_DELAY_SECONDS > self.RETRY_MAX_DELAY_SECONDS:
             raise ValueError(
@@ -443,6 +531,42 @@ class Settings(BaseSettings):
             return float(self.BOT_CAPITAL_BASE_USD)
         eq = max(0.0, float(account_equity))
         return min(eq, float(self.MAX_EQUITY_USAGE_USD))
+
+    @property
+    def max_dollars_per_trade(self) -> float:
+        return float(self.MAX_EQUITY_USAGE_USD)
+
+    @property
+    def sector_map(self) -> dict[str, str]:
+        try:
+            raw = json.loads(self.SECTOR_MAP_JSON or "{}")
+        except Exception:  # noqa: BLE001
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            ks = str(k).strip().upper()
+            vs = str(v).strip()
+            if ks and vs:
+                out[ks] = vs
+        return out
+
+    def sector_for_symbol(self, symbol: str) -> str:
+        return self.sector_map.get(str(symbol).strip().upper(), "Unknown")
+
+    def spread_filter_pct_for_feed(self, feed: Optional[str]) -> float:
+        """Max allowed relative spread for a quote from the given Alpaca data feed.
+
+        SIP (and unknown feeds) always use ``SPREAD_FILTER_PCT``. When
+        ``SPREAD_FILTER_PCT_IEX`` is set, quotes with ``feed=iex`` use that
+        threshold instead; otherwise IEX quotes use the same threshold as other
+        feeds.
+        """
+        f = (feed or "").strip().lower()
+        if f == FEED_IEX and self.SPREAD_FILTER_PCT_IEX is not None:
+            return float(self.SPREAD_FILTER_PCT_IEX)
+        return float(self.SPREAD_FILTER_PCT)
 
 
 @lru_cache(maxsize=1)
