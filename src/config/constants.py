@@ -72,6 +72,13 @@ TICK_SIZE_BELOW_ONE = 0.0001
 DEFAULT_WS_RECONNECT_MAX_DELAY = 60.0
 DEFAULT_REST_TIMEOUT_SECONDS = 15.0
 
+# Websocket staleness alerting (local / laptop supervision)
+STREAM_STALE_SECONDS_DEFAULT: float = 30.0
+STREAM_NOTIFICATION_COOLDOWN_SECONDS_DEFAULT: float = 300.0
+
+# Laptop resource checks
+LOW_BATTERY_THRESHOLD_PCT_DEFAULT: int = 20
+
 # -----------------------------------------------------------------------------
 # Logger names
 # -----------------------------------------------------------------------------

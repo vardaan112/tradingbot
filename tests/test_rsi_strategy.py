@@ -105,10 +105,10 @@ def test_rsi_strategy_no_signal_when_not_oversold(settings):
     )
 
 
-def test_rsi_strategy_emits_enter_when_oversold(settings):
+def test_rsi_strategy_emits_enter_when_oversold(make_settings_factory):
+    settings = make_settings_factory(ADX_RANGE_MAX=100.0)
     strat = RSIMeanReversionStrategy(settings)
-    # Construct a clearly oversold tail by appending a strong decline.
-    n = 200
+    n = 260
     idx = pd.date_range("2026-01-01", periods=n, freq="5min", tz=timezone.utc)
     base = np.full(n, 100.0)
     # Drop fast in the last 50 bars to push RSI into oversold.
@@ -138,9 +138,10 @@ def test_rsi_strategy_emits_enter_when_oversold(settings):
     assert SignalAction.ENTER_LONG in actions
 
 
-def test_rsi_strategy_blocks_entry_when_open_order_present(settings):
+def test_rsi_strategy_blocks_entry_when_open_order_present(make_settings_factory):
+    settings = make_settings_factory(ADX_RANGE_MAX=100.0)
     strat = RSIMeanReversionStrategy(settings)
-    n = 200
+    n = 260
     idx = pd.date_range("2026-01-01", periods=n, freq="5min", tz=timezone.utc)
     base = np.full(n, 100.0)
     base[-50:] = np.linspace(100, 80, 50)

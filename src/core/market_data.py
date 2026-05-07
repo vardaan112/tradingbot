@@ -221,6 +221,79 @@ class BarFetcher:
             logger=self._log,
         )
 
+    def fetch_mean_daily_volume_batch(
+        self,
+        symbols: list[str],
+        *,
+        calendar_lookback_days: int,
+        min_rows: int,
+    ) -> dict[str, tuple[float, float]]:
+        """Per symbol: (mean daily share volume, last available close) over window.
+
+        Drops symbols with fewer than ``min_rows`` daily observations in the slice.
+        """
+        if not symbols:
+            return {}
+        tf_day = TimeFrame(1, TimeFrameUnit.Day)
+        calendar_lookback_days = max(int(calendar_lookback_days), 5)
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=int(calendar_lookback_days) + 25)
+        chunk_size = 100
+        out: dict[str, tuple[float, float]] = {}
+
+        for off in range(0, len(symbols), chunk_size):
+            chunk = [s.upper() for s in symbols[off : off + chunk_size]]
+            request = StockBarsRequest(
+                symbol_or_symbols=chunk,
+                timeframe=tf_day,
+                start=start,
+                end=end,
+                feed=self._feed_enum,
+                limit=10_000,
+            )
+
+            def _do_batch() -> pd.DataFrame:
+                try:
+                    resp = self._client.get_stock_bars(request)
+                except Exception as exc:  # noqa: BLE001
+                    raise BrokerConnectionError(f"get_stock_bars(batch): {exc}") from exc
+                try:
+                    df = resp.df
+                except Exception as exc:  # noqa: BLE001
+                    raise BrokerConnectionError(f"bars df conversion failed: {exc}") from exc
+                if df is None or df.empty:
+                    return pd.DataFrame()
+                return df
+
+            df = retry_call(
+                _do_batch,
+                max_attempts=self._max_attempts,
+                base_delay=self._base_delay,
+                max_delay=self._max_delay,
+                op_name="fetch_daily_volume_batch",
+                logger=self._log,
+            )
+            if df.empty:
+                continue
+            if isinstance(df.index, pd.MultiIndex) and "symbol" in df.index.names:
+                for sym in chunk:
+                    try:
+                        sub = df.xs(sym, level="symbol")
+                    except KeyError:
+                        continue
+                    if sub.empty:
+                        continue
+                    tail = sub.tail(calendar_lookback_days)
+                    if len(tail) < min_rows:
+                        continue
+                    vol_series = tail["volume"].astype(float)
+                    close_last = float(tail["close"].iloc[-1])
+                    if close_last <= 0:
+                        continue
+                    out[sym] = (float(vol_series.mean()), close_last)
+
+        return out
+
     def fetch_latest_quote(self, symbol: str) -> Quote:
         request = StockLatestQuoteRequest(symbol_or_symbols=[symbol], feed=self._feed_enum)
 

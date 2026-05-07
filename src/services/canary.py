@@ -23,6 +23,7 @@ order stack (`core.orders.OrderService`) remains unaltered.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ from alpaca.trading.requests import LimitOrderRequest
 from config.constants import LOGGER_APP, LOGGER_ORDERS
 from config.settings import Settings
 from core.account import AccountAdapter
+from core.database import Database
 from core.exceptions import (
     BrokerConnectionError,
     KillSwitchLatchedError,
@@ -822,7 +824,11 @@ class CanaryService:
 # ---------------------------------------------------------------------------
 
 
-async def maybe_run_canary(settings: Settings) -> bool:
+async def maybe_run_canary(
+    settings: Settings,
+    *,
+    database: Optional[Database] = None,
+) -> bool:
     """Run the canary if all gates allow it. Returns True iff main loop may proceed.
 
     Gating order (fail-closed where it matters):
@@ -928,6 +934,21 @@ async def maybe_run_canary(settings: Settings) -> bool:
             fractional=result.fractional,
         ),
     )
+
+    if database is not None:
+        with contextlib.suppress(Exception):
+            database.record_canary_result(
+                success=bool(result.success),
+                symbol=result.symbol or None,
+                quantity=float(result.buy_filled_qty) if result.buy_filled_qty else None,
+                notional=float(result.notional_attempted),
+                error=None if result.success else (result.reason or "failed"),
+                metadata={
+                    "buy_coid": result.buy_coid,
+                    "sell_coid": result.sell_coid,
+                    "fractional": result.fractional,
+                },
+            )
 
     if not result.success:
         log.error(

@@ -4,6 +4,8 @@ Triggers when current equity drops `KILL_SWITCH_DRAWDOWN_PCT` or more below
 the daily start-of-day equity baseline. Once latched, the latch survives
 process restarts until manually reset by deleting the latch state file or
 calling `KillSwitch.reset(force=True, operator_token=...)`.
+
+Persisted latch path (under ``STATE_DIR``): ``kill_switch_state.json``.
 """
 
 from __future__ import annotations

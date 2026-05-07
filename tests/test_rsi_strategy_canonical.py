@@ -55,7 +55,7 @@ def _quote(symbol: str = "SPY", bid: float = 99.95, ask: float = 100.0) -> Quote
     )
 
 
-def _bars_with_drop(n: int = 200, *, drop_to: float = 80.0) -> pd.DataFrame:
+def _bars_with_drop(n: int = 260, *, drop_to: float = 80.0) -> pd.DataFrame:
     """Bar series flat at 100 then linearly declining to drop_to over the last 50 bars."""
     idx = pd.date_range(
         end=datetime.now(timezone.utc) - timedelta(minutes=10),
@@ -114,7 +114,9 @@ def test_legacy_import_path_still_works():
 # ---------------------------------------------------------------------------
 
 
-def test_enter_long_when_rsi_oversold(settings):
+def test_enter_long_when_rsi_oversold(make_settings_factory):
+    """Wide ADX_RANGE_MAX treats the declining series as range-bound → entries allowed."""
+    settings = make_settings_factory(ADX_RANGE_MAX=100.0)
     strat = RSIMeanReversionStrategy(settings)
     bars = _bars_with_drop()
     ctx = StrategyContext(
@@ -131,7 +133,8 @@ def test_enter_long_when_rsi_oversold(settings):
     assert any(s.action == SignalAction.ENTER_LONG for s in signals)
 
 
-def test_signal_metadata_includes_required_fields(settings):
+def test_signal_metadata_includes_required_fields(make_settings_factory):
+    settings = make_settings_factory(ADX_RANGE_MAX=100.0)
     strat = RSIMeanReversionStrategy(settings)
     bars = _bars_with_drop()
     ctx = StrategyContext(
@@ -157,12 +160,22 @@ def test_signal_metadata_includes_required_fields(settings):
         "spread_pct",
         "quote_age_seconds",
         "strategy_name",
+        "regime_type",
+        "adx",
+        "sma200",
+        "sma_slope",
+        "price_above_sma200",
+        "high_conviction",
+        "trailing_stop_active",
+        "trailing_stop_price",
+        "conviction_risk_multiplier",
     ):
         assert key in md, f"missing metadata key: {key}"
     assert md["strategy_name"] == "rsi_meanrev"
 
 
-def test_no_signal_when_open_order_present(settings):
+def test_no_signal_when_open_order_present(make_settings_factory):
+    settings = make_settings_factory(ADX_RANGE_MAX=100.0)
     strat = RSIMeanReversionStrategy(settings)
     bars = _bars_with_drop()
     ctx = StrategyContext(

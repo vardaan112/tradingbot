@@ -7,3 +7,16 @@ numpy>=1.26,<3.0
 pytz>=2024.1
 tenacity>=8.2,<10.0
 httpx>=0.27,<1.0
+vaderSentiment>=3.3,<4.0
+psutil>=5.9,<7.0
+streamlit>=1.37,<2.0
+plotly>=5.18,<7.0
+streamlit-autorefresh>=1.0,<2.0
+
+# Phase 8 / ops: Discord + sklearn ML gate (also: pip install discord.py scikit-learn xgboost ...)
+discord.py>=2.3,<3.0
+scikit-learn>=1.4,<2.0
+xgboost>=2.0,<3.0
+# Optional: desktop websocket/battery alerts (see README)
+plyer>=2.1,<3.0
+

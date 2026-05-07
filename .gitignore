@@ -8,6 +8,8 @@ logs/*
 !logs/.gitkeep
 runtime/*
 !runtime/.gitkeep
+reports/*
+!reports/.gitkeep
 *.pid
 
 # Python
@@ -71,4 +73,5 @@ data/
 *.csv
 *.parquet
 *.sqlite
+*.sqlite3
 *.db

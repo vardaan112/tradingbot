@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from core.account import AccountSnapshot
 from risk.compliance import ComplianceAdapter
 from risk.exposure import ExposureChecker
@@ -113,3 +115,100 @@ def test_buying_power_cap_respected(make_settings_factory):
     )
     # buying_power 300 / entry 100 -> floor(3) = 3 shares cap.
     assert result.shares == 3
+
+
+def test_conviction_multiplier_scales_risk_budget(make_settings_factory):
+    settings = make_settings_factory(
+        BOT_CAPITAL_BASE_USD=10_000.0,
+        MAX_RISK_PER_TRADE_PCT=0.01,
+        ATR_STOP_MULTIPLIER=1.0,
+        MAX_EQUITY_USAGE_USD=1_000_000.0,
+        MAX_GROSS_EXPOSURE_PCT=2.0,
+        MAX_OPEN_POSITIONS=5,
+    )
+    sizer = _build(settings)
+    account = make_account(equity=100_000.0, buying_power=1_000_000.0, regt=1_000_000.0)
+
+    base = sizer.size(
+        symbol="SPY",
+        entry_price=50.0,
+        atr=1.0,
+        account=account,
+        positions=[],
+        bot_managed_notional=0.0,
+        conviction_risk_multiplier=1.0,
+    )
+    hi = sizer.size(
+        symbol="SPY",
+        entry_price=50.0,
+        atr=1.0,
+        account=account,
+        positions=[],
+        bot_managed_notional=0.0,
+        conviction_risk_multiplier=1.5,
+    )
+    lo = sizer.size(
+        symbol="SPY",
+        entry_price=50.0,
+        atr=1.0,
+        account=account,
+        positions=[],
+        bot_managed_notional=0.0,
+        conviction_risk_multiplier=0.5,
+    )
+    assert base.shares > 0 and hi.shares > 0 and lo.shares > 0
+    assert hi.shares > base.shares > lo.shares
+    assert hi.effective_risk_pct == pytest.approx(0.015)
+    assert lo.effective_risk_pct == pytest.approx(0.005)
+    assert "conv_mult=" in hi.rationale
+
+
+def test_tight_usd_cap_dominates_conviction_multipliers(make_settings_factory):
+    settings = make_settings_factory(
+        BOT_CAPITAL_BASE_USD=1_000_000.0,
+        MAX_RISK_PER_TRADE_PCT=0.05,
+        ATR_STOP_MULTIPLIER=1.0,
+        MAX_EQUITY_USAGE_USD=500.0,
+        MAX_GROSS_EXPOSURE_PCT=2.0,
+        MAX_OPEN_POSITIONS=5,
+    )
+    sizer = _build(settings)
+    account = make_account(equity=100_000.0, buying_power=1_000_000.0)
+
+    a = sizer.size(
+        symbol="SPY",
+        entry_price=100.0,
+        atr=1.0,
+        account=account,
+        positions=[],
+        bot_managed_notional=0.0,
+        conviction_risk_multiplier=1.0,
+    )
+    b = sizer.size(
+        symbol="SPY",
+        entry_price=100.0,
+        atr=1.0,
+        account=account,
+        positions=[],
+        bot_managed_notional=0.0,
+        conviction_risk_multiplier=1.5,
+    )
+    assert a.shares == b.shares == 5.0
+    assert "usd_cap" in a.rationale or "usd_cap" in b.rationale
+
+
+def test_sizing_block_reason_returns_zero_shares(settings):
+    sizer = _build(settings)
+    account = make_account()
+    reason = "correlation_breaker_leader_SPY_follower_QQQ"
+    out = sizer.size(
+        symbol="QQQ",
+        entry_price=100.0,
+        atr=2.0,
+        account=account,
+        positions=[],
+        bot_managed_notional=0.0,
+        sizing_block_reason=reason,
+    )
+    assert out.shares == 0
+    assert out.skipped_reason == reason

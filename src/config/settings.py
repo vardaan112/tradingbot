@@ -21,9 +21,12 @@ from .constants import (
     FEED_IEX,
     FEED_SIP,
     LIVE_TRADING_CONFIRMATION_PHRASE,
+    LOW_BATTERY_THRESHOLD_PCT_DEFAULT,
     REGULATORY_MODE_AUTO,
     REGULATORY_MODE_INTRADAY_MARGIN,
     REGULATORY_MODE_PDT,
+    STREAM_NOTIFICATION_COOLDOWN_SECONDS_DEFAULT,
+    STREAM_STALE_SECONDS_DEFAULT,
     VALID_ALPACA_ENVS,
     VALID_FEEDS,
     VALID_REGULATORY_MODES,
@@ -76,6 +79,19 @@ class Settings(BaseSettings):
     ATR_PROFIT_MULTIPLIER: float = Field(3.0, gt=0.0, le=50.0)
     MAX_HOLD_BARS: int = Field(24, ge=1, le=10_000)
 
+    # ---- Regime & synthetic trailing-profit (Phase Two) ----------------------------
+    ADX_LENGTH: int = Field(14, ge=2, le=500)
+    ADX_RANGE_MAX: float = Field(25.0, gt=0.0, le=100.0)
+    SMA_FILTER_LENGTH: int = Field(200, ge=10, le=5000)
+    SMA_SLOPE_LOOKBACK_BARS: int = Field(5, ge=1, le=500)
+
+    TRAIL_TRIGGER_PCT: float = Field(0.01, gt=0.0, le=0.25)
+    TRAIL_LOCKED_PROFIT_PCT: float = Field(0.005, gt=0.0, le=0.25)
+    TRAIL_ATR_MULTIPLIER: float = Field(1.5, gt=0.0, le=50.0)
+
+    HIGH_CONVICTION_RISK_MULTIPLIER: float = Field(1.5, gt=0.05, le=10.0)
+    LOW_CONVICTION_RISK_MULTIPLIER: float = Field(0.5, gt=0.05, le=10.0)
+
     # ---- Risk ----------------------------------------------------------------------
     MAX_RISK_PER_TRADE_PCT: float = Field(0.01, gt=0.0, le=0.05)
     MAX_EQUITY_USAGE_USD: float = Field(50.0, gt=0.0)
@@ -121,6 +137,112 @@ class Settings(BaseSettings):
     CANARY_NOTIONAL_USD: float = Field(10.0, gt=0.0)
     CANARY_TIMEOUT_SECONDS: float = Field(60.0, gt=0.0, le=600.0)
     CANARY_PERSIST_FILENAME: str = "canary_state.json"
+
+    # ---- Phase 3: dynamic universe + global risk -----------------------------------
+    # When enabled, periodic liquidity scan selects top SCANNER_TOP_N US equities by
+    # average daily dollar volume instead of relying on SYMBOLS alone. SYMBOLS remains
+    # the failover basket if the scanner errors.
+    DYNAMIC_UNIVERSE_ENABLED: bool = False
+    SCANNER_TOP_N: int = Field(20, ge=1, le=100)
+    SCANNER_VOLUME_LOOKBACK_DAYS: int = Field(30, ge=5, le=252)
+    # Cap how many US equities we pull daily bars for (API + CPU budget).
+    SCANNER_MAX_CANDIDATES: int = Field(500, ge=50, le=8000)
+    # Require at least this many completed daily observations before ranking.
+    SCANNER_MIN_HISTORY_DAYS: int = Field(20, ge=5, le=252)
+    # Eastern-time clock hour/minute — refresh once per session-day after regular open.
+    SCANNER_REFRESH_HOUR_ET: int = Field(9, ge=7, le=12)
+    SCANNER_REFRESH_MINUTE_ET: int = Field(31, ge=0, le=59)
+
+    # Correlation gate: skip follower entries when leader is long and SPY/QQQ closes
+    # are too correlated over CORRELATION_LOOKBACK_CALENDAR_DAYS.
+    CORRELATION_BREAKER_ENABLED: bool = True
+    CORRELATION_LEADER_SYMBOL: str = "SPY"
+    CORRELATION_FOLLOWER_SYMBOLS: str = "QQQ"
+    CORRELATION_BREAKER_THRESHOLD: float = Field(0.85, ge=0.0, le=0.9999)
+    CORRELATION_LOOKBACK_CALENDAR_DAYS: int = Field(30, ge=5, le=365)
+
+    # Black swan: SPY rolls down BLACK_SWAN_DROP_PCT within BLACK_SWAN_WINDOW_MINUTES.
+    BLACK_SWAN_ENABLED: bool = True
+    BLACK_SWAN_SYMBOL: str = "SPY"
+    BLACK_SWAN_DROP_PCT: float = Field(0.03, gt=0.0, le=0.5)
+    BLACK_SWAN_WINDOW_MINUTES: int = Field(15, ge=1, le=240)
+
+    # Emit a Markdown tearsheet table in heartbeat logs every N seconds (0 disables).
+    HEARTBEAT_TEARSHEET_MARKDOWN_INTERVAL_SECONDS: float = Field(3600.0, ge=0.0, le=86400.0)
+
+    # ---- Phase 4: sentiment + anti-martingale + SQLite + chase + reporter ---------
+    SENTIMENT_ENABLED: bool = False
+    SENTIMENT_HEADLINE_LIMIT: int = Field(10, ge=1, le=50)
+    SENTIMENT_STRONG_NEGATIVE_THRESHOLD: float = Field(-0.5, ge=-1.0, le=0.0)
+    SENTIMENT_CACHE_TTL_SECONDS: float = Field(300.0, ge=30.0, le=86400.0)
+    SENTIMENT_STALE_AFTER_SECONDS: float = Field(1800.0, ge=60.0, le=604800.0)
+    SENTIMENT_FAIL_CLOSED: bool = False
+    SENTIMENT_FAIL_CONSECUTIVE_THRESHOLD: int = Field(3, ge=1, le=20)
+
+    PASSIVE_JOINER_ENABLED: bool = False
+    PASSIVE_JOINER_TIMEOUT_SECONDS: float = Field(15.0, gt=0.0, le=120.0)
+    PASSIVE_JOINER_MAX_ATTEMPTS: int = Field(3, ge=1, le=10)
+    PASSIVE_JOINER_SIDE_BUY_PRICE: str = "best_bid"
+    PASSIVE_JOINER_REQUIRE_FRESH_QUOTE: bool = True
+
+    DATABASE_PATH: Path = Field(Path("./runtime/tradingbot.sqlite3"))
+
+    # ---- Phase 8: adaptive brain & remote command center ---------------------
+    ENABLE_AUTOTUNE: bool = False
+    AUTOTUNE_SUNDAY_HOUR_ET: int = Field(21, ge=17, le=23)
+    AUTOTUNE_LOOKBACK_DAYS: int = Field(30, ge=7, le=366)
+    AUTOTUNE_MIN_TRADES_PER_CONFIG: int = Field(10, ge=1, le=500)
+    AUTOTUNE_MAX_DRAWDOWN_ABS: float = Field(0.45, gt=0.0, le=1.0)
+    DYNAMIC_PARAMS_PATH: Path = Field(default_factory=lambda: Path("src/config/dynamic_params.json"))
+
+    ENABLE_ML_FILTER: bool = False
+    ML_FILTER_THRESHOLD: float = Field(0.55, gt=0.0, lt=1.0)
+    MIN_ML_TRAINING_TRADES: int = Field(50, ge=5, le=50_000)
+    ML_MODEL_PATH: Path = Field(Path("./runtime/models/ml_signal_filter.pkl"))
+    ML_MODEL_META_PATH: Path = Field(Path("./runtime/models/ml_signal_filter_meta.json"))
+    ML_MAX_TRAINING_TRADES: int = Field(500, ge=50, le=50_000)
+    ML_INFERENCE_RECENT_CONTEXT: int = Field(100, ge=10, le=5000)
+    ML_ABORT_ON_TRAINING_FAILURE: bool = False
+    ML_BLOCK_ENTRIES_ON_TRAINING_FAILURE: bool = True
+
+    ENABLE_DISCORD_BOT: bool = False
+    # When True, standalone Discord startup/first-contact must succeed or startup aborts.
+    REQUIRE_DISCORD_ON_STARTUP: bool = False
+    DISCORD_BOT_TOKEN: str = Field("", repr=False)
+    DISCORD_CHANNEL_ID: str = ""
+    DISCORD_ALLOWED_USER_IDS: str = ""
+    DISCORD_COMMAND_RATE_LIMIT_SECONDS: float = Field(5.0, ge=1.0, le=3600.0)
+
+    ENABLE_KELLY_SIZING: bool = False
+    KELLY_LOOKBACK_TRADES: int = Field(100, ge=5, le=50_000)
+    KELLY_FRACTION: float = Field(0.25, gt=0.0, le=1.0)
+    KELLY_MIN_TRADES: int = Field(30, ge=5, le=50_000)
+    KELLY_MAX_RISK_MULTIPLIER: float = Field(1.5, gt=0.0, le=5.0)
+    KELLY_MIN_RISK_MULTIPLIER: float = Field(0.25, gt=0.0, le=5.0)
+
+    ANTI_MARTINGALE_ENABLED: bool = False
+    ANTI_MARTINGALE_LOSS_STREAK: int = Field(3, ge=1, le=50)
+    ANTI_MARTINGALE_WIN_RECOVERY: int = Field(2, ge=1, le=50)
+    ANTI_MARTINGALE_DEFENSIVE_MULTIPLIER: float = Field(0.5, gt=0.0, le=1.0)
+    ANTI_MARTINGALE_NORMAL_MULTIPLIER: float = Field(1.0, gt=0.0, le=1.0)
+
+    REPORTS_DIR: Path = Path("./reports")
+    DAILY_REPORT_ENABLED: bool = False
+
+    TEARSHEET_PRIMARY: Literal["sqlite", "orders_log"] = "sqlite"
+
+    # ---- Local chaos / resilience (laptop soak testing; optional on VPS)
+    STREAM_STALE_SECONDS: float = Field(default=STREAM_STALE_SECONDS_DEFAULT, gt=5.0, le=900.0)
+    STREAM_NOTIFICATION_COOLDOWN_SECONDS: float = Field(
+        default=STREAM_NOTIFICATION_COOLDOWN_SECONDS_DEFAULT,
+        ge=30.0,
+        le=86400.0,
+    )
+    ENABLE_LOCAL_NOTIFICATIONS: bool = True
+
+    WARN_ON_LOW_BATTERY: bool = True
+    LOW_BATTERY_THRESHOLD_PCT: int = Field(default=LOW_BATTERY_THRESHOLD_PCT_DEFAULT, ge=0, le=100)
+    REQUIRE_POWER_FOR_LOCAL_LIVE: bool = False
 
     # ---- Validators ----------------------------------------------------------------
     @field_validator("ALPACA_ENV")
@@ -187,6 +309,27 @@ class Settings(BaseSettings):
             raise ValueError(f"CANARY_PERSIST_FILENAME must be a bare filename: {name!r}")
         return name
 
+    @field_validator("CORRELATION_LEADER_SYMBOL", "BLACK_SWAN_SYMBOL")
+    @classmethod
+    def _validate_phase3_leader_symbols(cls, v: str) -> str:
+        sym = v.strip().upper()
+        if not sym:
+            raise ValueError("Ticker must not be empty")
+        if not sym.isascii() or not all(c.isalnum() or c in {".", "-", "/"} for c in sym):
+            raise ValueError(f"invalid ticker: {sym!r}")
+        return sym
+
+    @field_validator("CORRELATION_FOLLOWER_SYMBOLS")
+    @classmethod
+    def _validate_correlation_followers(cls, v: str) -> str:
+        cleaned = ",".join(s.strip().upper() for s in v.split(",") if s.strip())
+        if not cleaned:
+            raise ValueError("CORRELATION_FOLLOWER_SYMBOLS requires at least one symbol")
+        for sym in cleaned.split(","):
+            if not sym.isascii() or not all(c.isalnum() or c in {".", "-", "/"} for c in sym):
+                raise ValueError(f"CORRELATION_FOLLOWER_SYMBOLS invalid ticker: {sym!r}")
+        return cleaned
+
     @model_validator(mode="after")
     def _validate_consistency(self) -> "Settings":
         # Live trading requires explicit confirmation phrase.
@@ -210,6 +353,11 @@ class Settings(BaseSettings):
             raise ValueError(
                 "RETRY_BASE_DELAY_SECONDS must be <= RETRY_MAX_DELAY_SECONDS."
             )
+        db_str = str(self.DATABASE_PATH).strip()
+        if not db_str:
+            raise ValueError("DATABASE_PATH must not be empty")
+        if not str(self.REPORTS_DIR).strip():
+            raise ValueError("REPORTS_DIR must not be empty")
         return self
 
     # ---- Convenience ---------------------------------------------------------------
@@ -217,6 +365,24 @@ class Settings(BaseSettings):
     def symbols_list(self) -> list[str]:
         """Return SYMBOLS as a clean uppercase list."""
         return [s for s in self.SYMBOLS.split(",") if s]
+
+    @property
+    def discord_allowed_user_ids_set(self) -> set[int]:
+        ids: set[int] = set()
+        for chunk in self.DISCORD_ALLOWED_USER_IDS.split(","):
+            c = chunk.strip()
+            if not c:
+                continue
+            try:
+                ids.add(int(c))
+            except ValueError:
+                continue
+        return ids
+
+    @property
+    def correlation_follower_symbols_list(self) -> list[str]:
+        cleaned = ",".join(s.strip().upper() for s in self.CORRELATION_FOLLOWER_SYMBOLS.split(",") if s.strip())
+        return [s for s in cleaned.split(",") if s]
 
     @property
     def is_paper(self) -> bool:

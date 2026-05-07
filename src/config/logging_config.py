@@ -92,6 +92,19 @@ def get_context_filter() -> BotContextFilter:
     return _context_filter
 
 
+def reset_logging_for_tests() -> None:
+    """Undo `configure_logging` side effects so pytest ``caplog`` works across tests."""
+
+    global _configured
+    with _configured_lock:
+        _configured = False
+    for logger_name in _LOG_FILES:
+        lg = logging.getLogger(logger_name)
+        lg.handlers.clear()
+        lg.propagate = True
+        lg.setLevel(logging.NOTSET)
+
+
 def _build_file_handler(path: Path, level: int) -> logging.Handler:
     handler = logging.handlers.RotatingFileHandler(
         path,

@@ -36,6 +36,10 @@ src/
     settings.py                    env-driven validated settings
     constants.py                   compile-time constants
     logging_config.py              rotating-file logging
+  communication/
+    discord_client.py            DiscordCommandCenter + slash (/status,/kill,/report)
+  ml/
+    signal_filter.py             sklearn RandomForest gate (fail-open)
   core/
     alpaca_clients.py              alpaca-py client wiring + feed detection
     market_data.py                 quote cache + historical bar fetcher
@@ -47,8 +51,9 @@ src/
     state_store.py                 atomic JSON state persistence
     exceptions.py                  bot-specific exception hierarchy
   risk/
-    killswitch.py                  latching kill switch
-    position_sizer.py              ATR-based sizing with hard clamps
+    killswitch.py                latching kill switch
+    kelly_sizer.py               fractional Kelly scaler (SQLite)
+    position_sizer.py            ATR-based sizing + Kelly hook + clamps
     compliance.py                  PDT vs intraday-margin mode
     exposure.py                    gross/net exposure limits
   strategies/
@@ -61,7 +66,7 @@ src/
     orchestrator.py                top-level event loop
     heartbeat.py                   60s heartbeat task
     canary.py                      one-time live canary check at startup
-  utils/                           ids, math, price, time helpers
+  utils/                           ids, math, price, time helpers (+ offline `backtester`)
 runtime/                           persistent state (gitignored)
 logs/                              rotating log files (gitignored)
 tests/                             unit tests (run offline, no network)
@@ -91,6 +96,25 @@ If you also want the dev/test extras:
 ```bash
 pip install -e .[dev]
 ```
+
+Core Phase 8 / ops packages may also be installed explicitly:
+
+```bash
+pip install discord.py scikit-learn xgboost psutil python-dotenv alpaca-py
+```
+
+---
+
+## Pre-flight checklist
+
+1. Install dependencies: `pip install -r requirements.txt`
+2. Ensure `.env` exists and contains Alpaca keys, Discord token / `DISCORD_CHANNEL_ID` / `DISCORD_ALLOWED_USER_IDS` when Discord is enabled, and an explicit `DRY_RUN` setting.
+3. Run offline tests: `pytest`
+4. Start in dry-run first: `DRY_RUN=true python main.py`
+5. Confirm Discord shows the startup banner (with clear `DRY_RUN` truth) and `SIMULATED FILL` notifications if you exercised entries in dry-run.
+6. Only then, deliberately set `DRY_RUN=false` when you intend real orders.
+
+Never run `DRY_RUN=false` unless you have verified Discord alerts (unless you explicitly disable/require them), canary behaviour, kill switch semantics, and dry-run simulated fill notifications.
 
 ---
 
@@ -122,6 +146,125 @@ The full annotated reference lives in `.env.example`. The most important keys:
 | `CANARY_PERSIST_FILENAME`        | `canary_state.json` | Filename under `STATE_DIR` for canary success persistence |
 
 **Never commit `.env`** - it is excluded by `.gitignore`.
+
+---
+
+## Strategy Time Machine & dashboard replay
+
+Historical **grid search** and **path-dependent simulation** live in `src/utils/backtester.py`. Bars are fetched with **Alpaca market data only** (`StockHistoricalDataClient`, adjusted bars). The backtester **never** imports the trading REST client, never submits orders, and never invokes Canary, Kill Switch, reconciliation, or live execution helpers.
+
+Caches live under **`runtime/cache/`**. When `pyarrow` or `fastparquet` is available, caches are stored as **Parquet**; otherwise CSV is written. Passing **`--refresh-cache`** deletes matching cache files and refetches before the sweep.
+
+Outputs (defaults):
+
+- `reports/backtest_results.csv` — one row per grid cell (Sharpe, max drawdown, profit factor, win rate, total return, etc.)
+- `reports/backtest_trades.csv` — one row per completed simulated trade (`parameter_set_id`, entry/exit, stop/trail semantics, regime)
+- `reports/backtest_summary.md` — narrative summary with ranked parameter sets
+
+The optimizer sweeps **RSI** entry thresholds (25 / 30 / 35), **ADX** floors (20 / 25 / 30), and **ATR** stop / trail multiples (1.5 / 2 / 3) — 27 combinations per symbol — using the same regime / filter intent as `filters.py` where applicable.
+
+### How to run the backtester
+
+From the repo root (pytest uses `pythonpath = ["src"]`; the primary importable tree is `utils`, `core`, … under `src/`):
+
+```bash
+pip install -e .
+
+# Preferred module path (shim under `src/src/utils/`):
+python -m src.utils.backtester
+
+# Equivalent:
+python -m utils.backtester
+backtest-bot --symbols SPY QQQ --start 2025-01-01 --end 2026-05-01 --timeframe 15Min
+```
+
+Useful flags: `--symbols`, `--start`, `--end` (UTC calendar dates), `--timeframe` (`1Min`, `5Min`, `15Min`, `1Hour`, `1Day`), `--initial-equity`, `--risk-pct`, **`--refresh-cache`** (ignore disk cache), `--use-cache` (default on) / `--no-cache`. Output paths: **`--output-results`**, **`--output-trades`**, **`--summary`**.
+
+### Replaying trades into SQLite (dashboard)
+
+`scripts/replay_simulator.py` reads **`reports/backtest_trades.csv`** (or `--trades-csv`), groups trades by calendar day, and inserts rows with **`source='simulation'`** plus replay metadata (`replay_run_id`, original timestamps). **Dry-run is the default** (prints counts only). **`--confirm-simulation`** performs the SQLite writes via `Database`; no Alpaca or order APIs are called.
+
+Approximate pacing between calendar days follows **`seconds_per_day = 1000 / speed`** (`--speed`, default `100`). A Markdown summary is always written (`--summary-out`, default **`reports/replay_summary.md`**).
+
+Example:
+
+```bash
+python scripts/replay_simulator.py --database runtime/tradingbot.sqlite --speed 500
+python scripts/replay_simulator.py --database runtime/tradingbot.sqlite --speed 500 --confirm-simulation
+```
+
+In the Streamlit dashboard, use the **trade source** filter (**live**, **simulation**, or **all**) to blend or isolate replayed rows.
+
+### Metrics (what they mean)
+
+- **Total return** — Ending equity vs starting simulation notional (includes a
+  simple spread / slippage model and optional per-side fee bps).
+- **Sharpe ratio** — Mean / standard deviation of **daily** equity returns,
+  annualized with \(\sqrt{252}\). Higher is better *in-sample*; it punishes
+  volatile equity paths.
+- **Max drawdown** — Worst peak-to-trough decline on **resampled daily**
+  equity; more negative is worse. Use it next to Sharpe to spot
+  high-return-but-brutal-tail configurations.
+- **Win rate** — Fraction of completed trades with positive simulated PnL.
+- **Profit factor** — Gross winning dollars divided by gross losing dollars;
+  above 1 means gross wins exceed gross losses (capped at 9999 in grid CSV when
+  there are no losing trades).
+
+### Interpretation & risk
+
+Strong backtest numbers **do not guarantee** live performance: partial fills,
+borrow, halts, latency, fees, and regime changes are only approximated.
+
+**Overfitting** is easy when grid-searching many thresholds on the same year of
+data. Treat the optimizer as a hypothesis generator—validate hold-out periods,
+different symbols, and forward paper trading before scaling
+`BOT_CAPITAL_BASE_USD` or `MAX_EQUITY_USAGE_USD`.
+
+Replayed dashboard rows are **synthetic audit trails** for visualization only; they are not live fills.
+
+---
+
+## Phase 8: Adaptive Brain & Remote Command Center
+
+All Phase 8 features default to **disabled** in code and `.env.example` (`false`).
+Enable deliberately and monitor risk.
+
+### Discord command center (`ENABLE_DISCORD_BOT`)
+
+- Primary implementation: **`src/communication/discord_client.py`** (`DiscordCommandCenter`) with optional **`discord.py`** `[project.optional-dependencies]` **dev**.
+- **`src/services/discord_bot.py`** re-exports the same surface for backwards compatibility.
+- Set **`DISCORD_BOT_TOKEN`**, **`DISCORD_CHANNEL_ID`**, and **`DISCORD_ALLOWED_USER_IDS`** (comma-separated Snowflake IDs). Slash commands **`/status`**, **`/kill`**, **`/report`**, and **`/skip SYMBOL`** are accepted only when invoked from **`DISCORD_CHANNEL_ID`** and by an allowed user.
+- **`/kill`** invokes the orchestrator hook that latches **`KillSwitch`**, **`cancel_all`**, then **`submit_emergency_flatten`** — the same emergency path as internal kill handling. Remote kill emits **`event=discord_remote_kill`** in logs before flatten.
+- Alerts (embeds): bot startup/shutdown, **ENTER_LONG** / **EXIT_LONG**, **BLACK_SWAN_TRIGGER**, **KILL_SWITCH_LATCHED**, **CANARY_FAILED** (one-shot Discord client during startup abort), **ML_TRADE_BLOCKED**, **WEBSOCKET_STALE**, **WEEKLY_AUTOTUNE_COMPLETE**, plus daily recap when **`DAILY_REPORT_ENABLED`** is on.
+- **Security warning:** **`/kill` is destructive**. Anyone with your bot token or a compromised Discord account could flatten positions. Rotate tokens on leak; use **`DISCORD_ALLOWED_USER_IDS`**; treat Discord as alerting/ops, not the sole risk boundary.
+
+### Walk-forward autotune (`ENABLE_AUTOTUNE`)
+
+- Implemented in **`src/services/autotune.py`**, scheduled from the orchestrator: **Sunday**, Eastern clock, hour ≥ **`AUTOTUNE_SUNDAY_HOUR_ET`** (default **21**).
+- Runs the existing backtest grid on the last **`AUTOTUNE_LOOKBACK_DAYS`** (default **30**) of **15-minute** Alpaca bars (same stack as `python -m src.utils.backtester`).
+- Selects parameters with a balanced composite score (**Sharpe − 2×|max drawdown| + bonus when profit factor > 1.2**), requiring at least **`AUTOTUNE_MIN_TRADES_PER_CONFIG`** completed trades per candidate (default **10**).
+- Rejects outright if **`|max_drawdown|`** exceeds **`AUTOTUNE_MAX_DRAWDOWN_ABS`** (fraction of equity curve; default **0.45**) before persistence.
+- Writes **`src/config/dynamic_params.json`** (path **`DYNAMIC_PARAMS_PATH`**) with `source: "autotune"`, **`backtest_start`** / **`backtest_end`** (calendar dates aligned with walk-forward window), **`atr_multiplier`** (alias of **`atr_stop_multiplier`**), **`lookback_*`**, **`score`**, **`sharpe_ratio`**, metrics — **only** if validation passes and the composite score is **not worse** than the previous autotune score. Prior files are copied to **`runtime/param_backups/`** before replacement.
+- With **`ENABLE_AUTOTUNE=false`**, the live strategy uses static **`Settings`** only. JSON overrides **never** replace secrets in **`.env`**.
+
+### ML signal filter (`ENABLE_ML_FILTER`)
+
+- Canonical module: **`src/ml/signal_filter.py`** (`MLSignalFilter`, **`RandomForestClassifier`**). **`src/strategies/ml_filter.py`** re-exports for legacy imports.
+- Trains from SQLite **`completed_trades`** (live/paper; **excludes** `simulation`). Gates long entries at **`ML_FILTER_THRESHOLD`** (default **0.55**) via **`should_allow_trade`** / inference (`event=ml_filter_inference`, **`event=ml_trade_blocked`** when blocked, **`event=ml_filter_fail_open`** when allowing without a model or on errors).
+- **Fail-open** by design: missing model, insufficient rows (**`MIN_ML_TRAINING_TRADES`**, default **50**), or inference errors **allow** the trade.
+- Manual training: **`python -m src.strategies.ml_filter --train`** or **`python -m ml.signal_filter --train`** (both resolve the same entry point).
+- **Overfitting warning:** in-sample accuracy does not guarantee live edge.
+
+### Modified Kelly sizing (`ENABLE_KELLY_SIZING`)
+
+- **`src/risk/kelly_sizer.py`** (`KellySizer`, **`RiskSizingDecision`**) applies **fractional** Kelly to the existing per-trade **`base_risk_pct`** stack ( **`MAX_RISK_PER_TRADE_PCT` × conviction × anti-martingale** ), using recent realized PnLs (**`KELLY_LOOKBACK_TRADES`**, **`KELLY_MIN_TRADES`**, **`KELLY_FRACTION`**, **`KELLY_MAX_RISK_MULTIPLIER`** / **`KELLY_MIN_RISK_MULTIPLIER`**). Wired from **`PositionSizer`** with structured **`event=kelly_sizing`** lines.
+- Thin history / non-finite Kelly **falls back** to baseline risk — behaviour remains **limit-order-only** downstream.
+
+### Overfitting & capital
+
+Autotune and ML both learn from **history**. Performance in live markets can differ sharply. Raise **`BOT_CAPITAL_BASE_USD`** only after sustained monitoring.
+
+**Reminder:** Entries and exits use **limit logic only** — including **`submit_emergency_flatten`** (**marketable limit IOC**, not raw market orders per project policy).
 
 ---
 
@@ -319,6 +462,104 @@ pytest
 ```
 
 The test suite never touches the Alpaca API.
+
+---
+
+## Local laptop stress testing
+
+These tools help soak-test the bot on a laptop **before** moving to a VPS. Long-running
+production is still safer on stable power and networking; laptops sleep, roam Wi‑Fi, and lose
+battery.
+
+### Crash recovery (`state_recovery`)
+
+The bot reconciles Alpaca-held longs into the persisted bot ledger after restarts via
+``reconcile_open_positions`` / ``event=state_recovery`` (trail/stop hooks via
+``adopt_long_position``).
+
+```bash
+pytest tests/stress_test_recovery.py -q
+```
+
+### Flash crash detector (offline)
+
+Demonstrates ~10% SPY drop inside the 15-minute window using mocks only:
+
+```bash
+python scripts/mock_flash_crash.py
+```
+
+### Websocket staleness alerts
+
+While running, heartbeat evaluates stream health each interval. If both trading and market
+sockets appear up but quotes/events are stale for more than ``STREAM_STALE_SECONDS`` (default 30),
+or sockets are disconnected, the bot emits ``event=websocket_health`` and, when
+``ENABLE_LOCAL_NOTIFICATIONS=true`` (default locally), fires a desktop notification with a
+300-second cooldown via ``STREAM_NOTIFICATION_COOLDOWN_SECONDS``. Notification stacks: prefer
+``plyer`` if installed; else macOS ``osascript``, Windows beep/MessageBox, or ``notify-send``.
+
+```bash
+pytest tests/test_stream_alerts.py -q
+```
+
+### Battery and resource warnings
+
+Startup calls ``log_startup_local_health``. Each heartbeat logs ``event=local_resource_check``
+with CPU/memory/disk and best-effort battery status. Tune with:
+
+| Setting | Meaning |
+|---------|---------|
+| ``WARN_ON_LOW_BATTERY`` | Log warnings when below threshold |
+| ``LOW_BATTERY_THRESHOLD_PCT`` | Default 20 |
+| ``REQUIRE_POWER_FOR_LOCAL_LIVE`` | When ``true``, extra warnings if unplugged/low while live orders enabled |
+
+Trading is **not** auto-stopped on low battery unless you add operational policy elsewhere.
+
+```bash
+pytest tests/test_local_health.py -q
+```
+
+---
+
+## Trading Bot Command Center
+
+A dark-themed **read-only Streamlit dashboard** (`src/utils/dashboard.py`) for equities: live
+Alpaca balances/positions (**no order/mutation endpoints**), SQLite realized P&amp;L, kill-switch
+JSON, and a bounded tail of `logs/app.log`.
+
+**Install** (see `requirements.txt` — includes Streamlit, Plotly, optional autorefresh):
+
+```bash
+pip install "streamlit>=1.37,<2" "plotly>=5.18,<7" "streamlit-autorefresh>=1,<2"
+```
+
+**Run** from the repository root (reuse the same `.env` as the bot):
+
+```bash
+streamlit run src/utils/dashboard.py
+```
+
+The app loads **Alpaca keys, env, `DATABASE_PATH`, `LOG_DIR`, and `STATE_DIR`** from
+`get_settings()`. Secrets are not printed in the UI. If `streamlit-autorefresh` is missing,
+install it for ~10s auto-refresh; the app still runs with the **Refresh now** sidebar button.
+
+Treat the dashboard like **local-only** or **VPN/tunnel** tooling: do not expose Streamlit on
+the public internet.
+
+### What it shows
+
+- **Alpaca** (cached ~10s): equity, buying power, cash, open positions, open unrealized P/L;
+  cumulative P&amp;L and win rate come from SQLite completed trades unless the chart uses API.
+- **SQLite** (cached ~3s): schema-tolerant **`completed_trades`** (preferred) or **`trades`** /
+  **`executions`**; cumulative realized P&amp;L, profit factor, daily bars, recent 25 rows.
+- **Kill switch**: `STATE_DIR/kill_switch_state.json` (`latched` / `is_latched` / `kill_switch_latched`).
+- **Logs**: last 50 lines of `LOG_DIR/app.log` (bounded read).
+- **Live warning badge** when `ALPACA_ENV=live` and `DRY_RUN=false`.
+
+Replayed SQLite rows (**simulation**) can be blended via the sidebar scope filter (**live** /
+**simulation** / **all**) for daily realized totals sourced from `completed_trades`.
+
+If a data source fails, that section degrades gracefully while the rest keeps working.
 
 ---
 

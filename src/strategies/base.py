@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import pandas as pd
 
@@ -52,6 +52,10 @@ class StrategyContext:
     open_order_symbols: set[str]
     now_utc: datetime
     feed: str
+    sentiment_overlay: Optional[dict[str, Any]] = field(default=None)
+    anti_martingale_risk_mode: Optional[str] = None
+    anti_martingale_multiplier: Optional[float] = None
+    recent_trade_outcomes_hint: str = ""
 
     @property
     def has_position(self) -> bool:

@@ -37,13 +37,71 @@ class StreamHealth:
         self._market_ok: bool = False
         self._last_quote_ts: Optional[datetime] = None
         self._last_order_event_ts: Optional[datetime] = None
+        self._reconnect_attempts: int = 0
+        self._trading_connected_at: Optional[datetime] = None
+        self._trading_disconnected_at: Optional[datetime] = None
+        self._market_connected_at: Optional[datetime] = None
+        self._market_disconnected_at: Optional[datetime] = None
+
+    def increment_ws_reconnect_attempts(self) -> None:
+        with self._lock:
+            self._reconnect_attempts += 1
+
+    def websocket_health_snapshot(
+        self, *, stale_seconds_threshold: float
+    ) -> tuple[str, float, int]:
+        """Return `(status, seconds_since_last_msg, reconnect_count)`."""
+
+        with self._lock:
+            secs = self._secs_since_latest_message_locked()
+            reconn = int(self._reconnect_attempts)
+            ok_both = self._trading_ok and self._market_ok
+        status = "connected"
+        if not ok_both:
+            status = "disconnected"
+        elif secs > float(stale_seconds_threshold):
+            status = "stale"
+        return status, secs, reconn
+
+    def _secs_since_latest_message_locked(self) -> float:
+        now = datetime.now(timezone.utc)
+        candidates: list[datetime] = []
+        if self._last_quote_ts is not None:
+            candidates.append(self._last_quote_ts)
+        if self._last_order_event_ts is not None:
+            candidates.append(self._last_order_event_ts)
+        if not candidates:
+            return float("inf")
+        latest = max(candidates)
+        if latest.tzinfo is None:
+            latest = latest.replace(tzinfo=timezone.utc)
+        else:
+            latest = latest.astimezone(timezone.utc)
+        return max(0.0, (now - latest).total_seconds())
+
+    @property
+    def reconnect_attempt_count(self) -> int:
+        with self._lock:
+            return int(self._reconnect_attempts)
 
     def set_trading_ok(self, ok: bool) -> None:
+        now = datetime.now(timezone.utc)
         with self._lock:
+            prev = self._trading_ok
+            if ok and not prev:
+                self._trading_connected_at = now
+            if not ok and prev:
+                self._trading_disconnected_at = now
             self._trading_ok = ok
 
     def set_market_ok(self, ok: bool) -> None:
+        now = datetime.now(timezone.utc)
         with self._lock:
+            prev = self._market_ok
+            if ok and not prev:
+                self._market_connected_at = now
+            if not ok and prev:
+                self._market_disconnected_at = now
             self._market_ok = ok
 
     def mark_quote_event(self) -> None:
@@ -91,6 +149,7 @@ class TradingStreamRunner:
         self._trading_stream = trading_stream
         self._market_stream = market_stream
         self._symbols = [s.upper() for s in symbols]
+        self._subscribed_syms: set[str] = set(self._symbols)
         self._on_trade_update = on_trade_update
         self._on_quote = on_quote
         self._health = health
@@ -114,7 +173,26 @@ class TradingStreamRunner:
 
         self._tasks.append(asyncio.create_task(self._supervise(self._run_trading, "trading")))
         self._tasks.append(asyncio.create_task(self._supervise(self._run_market, "market")))
+        self._subscribed_syms = set(self._symbols)
         self._log.info("Trading + market streams started for %s", self._symbols)
+
+    def subscribe_quote_symbols(self, symbols: list[str]) -> list[str]:
+        """Subscribe to additional NBBO feeds (additive with alpaca-py StockDataStream).
+
+        Returns symbols successfully targeted in this call that were not previously
+        subscribed on this runner instance.
+        """
+        new_syms = [s.upper() for s in symbols if s.strip() and s.upper() not in self._subscribed_syms]
+        if not new_syms:
+            return []
+        try:
+            self._market_stream.subscribe_quotes(self._wrap_quote_handler, *new_syms)
+        except Exception as exc:  # noqa: BLE001
+            self._log.error("Failed extra quote subscriptions for %s: %s", new_syms, exc)
+            raise
+        self._subscribed_syms.update(new_syms)
+        self._log.info("Extra NBBO subscriptions online: %s", new_syms)
+        return new_syms
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -184,7 +262,11 @@ class TradingStreamRunner:
     ) -> None:
         """Restart `coro_factory()` with bounded exponential backoff on failure."""
         backoff = 1.0
+        first_iteration = True
         while not self._stop_event.is_set():
+            if not first_iteration:
+                self._health.increment_ws_reconnect_attempts()
+            first_iteration = False
             try:
                 await coro_factory()
                 if self._stop_event.is_set():
