@@ -134,7 +134,8 @@ The full annotated reference lives in `.env.example`. The most important keys:
 | `MAX_RISK_PER_TRADE_PCT`         | `0.01`         | 1% of capital base per trade (hard ceiling) |
 | `BOT_CAPITAL_BASE_USD`           | `0`            | Bot's allocated capital slice in USD. When >0, risk is computed against this instead of full account equity. 0 = fall back to `min(equity, MAX_EQUITY_USAGE_USD)` |
 | `KILL_SWITCH_DRAWDOWN_PCT`       | `0.05`         | 5% intraday drawdown latches the switch |
-| `SPREAD_FILTER_PCT`              | `0.0005`       | 5 bps max relative spread |
+| `SPREAD_FILTER_PCT`              | `0.0005`       | 5 bps max relative spread (SIP and default) |
+| `SPREAD_FILTER_PCT_IEX`          | *(unset)*      | Optional wider cap for `feed=iex` quotes only (e.g. `0.0012` = 12 bps) |
 | `QUOTE_STALENESS_SECONDS`        | `5`            | Reject signals on quotes older than this |
 | `REGULATORY_MODE`                | `auto`         | `auto`, `pdt`, or `intraday_margin` |
 | `POST_RULE4210_SCALING_ENABLED`  | `false`        | Required to relax legacy throttles after 2026-06-04 |
@@ -527,7 +528,14 @@ A dark-themed **read-only Streamlit dashboard** (`src/utils/dashboard.py`) for e
 Alpaca balances/positions (**no order/mutation endpoints**), SQLite realized P&amp;L, kill-switch
 JSON, and a bounded tail of `logs/app.log`.
 
-**Install** (see `requirements.txt` — includes Streamlit, Plotly, optional autorefresh):
+**Install** (see `requirements.txt`):
+
+```bash
+pip install streamlit-autorefresh
+pip install streamlit plotly pandas
+```
+
+Or install full project deps:
 
 ```bash
 pip install "streamlit>=1.37,<2" "plotly>=5.18,<7" "streamlit-autorefresh>=1,<2"
@@ -540,13 +548,18 @@ streamlit run src/utils/dashboard.py
 ```
 
 The app loads **Alpaca keys, env, `DATABASE_PATH`, `LOG_DIR`, and `STATE_DIR`** from
-`get_settings()`. Secrets are not printed in the UI. If `streamlit-autorefresh` is missing,
-install it for ~10s auto-refresh; the app still runs with the **Refresh now** sidebar button.
+`get_settings()`. Secrets are not printed in the UI. **`streamlit-autorefresh`** drives
+automatic reruns at the sidebar **Watchlist refresh interval** (default **30s**); without it,
+use **Refresh now**.
 
 Treat the dashboard like **local-only** or **VPN/tunnel** tooling: do not expose Streamlit on
 the public internet.
 
 ### What it shows
+
+- **Live Watchlist** (cached ~30s): default basket **SPY, QQQ, IWM, XLF, EEM** from `SYMBOLS`
+  plus **latest 5m bar close**, configurable-period **RSI** (`strategies.indicators.rsi`),
+  freshness vs last bar age, optional **spread %** from latest quote (read-only market data).
 
 - **Alpaca** (cached ~10s): equity, buying power, cash, open positions, open unrealized P/L;
   cumulative P&amp;L and win rate come from SQLite completed trades unless the chart uses API.

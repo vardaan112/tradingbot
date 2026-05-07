@@ -291,9 +291,10 @@ class CanaryService:
                 f"spread_compute_failed:{exc}",
                 started_at=started_at, symbol=symbol, notional=notional,
             )
-        if sp > self._settings.SPREAD_FILTER_PCT:
+        thresh = float(self._settings.spread_filter_pct_for_feed(quote.feed))
+        if sp > thresh:
             return self._precheck_fail(
-                f"spread_too_wide:{sp:.6f}>{self._settings.SPREAD_FILTER_PCT:.6f}",
+                f"spread_too_wide:{sp:.6f}>{thresh:.6f}",
                 started_at=started_at, symbol=symbol, notional=notional,
             )
 

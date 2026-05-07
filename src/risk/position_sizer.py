@@ -204,12 +204,42 @@ class PositionSizer:
         ]
         clamping_reason, clamped = min(candidates, key=lambda x: x[1])
 
-        if not self._settings.ENABLE_FRACTIONAL:
+        fractional_enabled = bool(self._settings.ENABLE_FRACTIONAL)
+        min_shares = float(self._settings.MIN_SHARES)
+        if fractional_enabled:
+            min_shares = min(min_shares, 0.001)
+        if not fractional_enabled:
             shares: float = float(math.floor(clamped))
         else:
             shares = max(0.0, math.floor(clamped * 1000.0) / 1000.0)
 
-        if shares < 1.0:
+        if shares < min_shares:
+            max_alloc = float(self._settings.max_dollars_per_trade)
+            floored_shares = float(math.floor(clamped))
+            if (not fractional_enabled) and (max_alloc / entry_price) < min_shares:
+                explicit_reason = (
+                    "SIZE_ZERO: price exceeds max allocation and fractional trading is disabled"
+                )
+            else:
+                explicit_reason = (
+                    f"SIZE_ZERO: clamped shares below MIN_SHARES={min_shares:.4f}"
+                )
+            self._log.warning(
+                "event=size_zero symbol=%s code=SIZE_ZERO price=%.6f max_allocation_usd=%.6f "
+                "raw_shares=%.8f clamped_shares=%.8f floored_shares=%.8f final_shares=%.8f "
+                "fractional_enabled=%s min_shares=%.4f clamping_reason=%s",
+                symbol,
+                entry_price,
+                max_alloc,
+                raw_shares,
+                clamped,
+                floored_shares,
+                shares,
+                str(fractional_enabled).lower(),
+                min_shares,
+                clamping_reason,
+                extra={"symbol": symbol},
+            )
             self._log_sizing(
                 symbol=symbol,
                 capital_base=capital_base,
@@ -237,7 +267,12 @@ class PositionSizer:
             )
             return self._skip(
                 symbol,
-                f"clamped_to_<1_via_{clamping_reason}",
+                (
+                    f"{explicit_reason}|price={entry_price:.6f}|cap={max_alloc:.6f}"
+                    f"|raw_shares={raw_shares:.8f}|floored_shares={floored_shares:.8f}"
+                    f"|fractional_enabled={str(fractional_enabled).lower()}"
+                    f"|clamped_by={clamping_reason}"
+                ),
                 entry_price=entry_price,
                 stop_distance=stop_distance,
                 risk_budget=risk_budget,

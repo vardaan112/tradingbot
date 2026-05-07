@@ -5,8 +5,9 @@ Run from the repository root (same ``.env`` as the bot)::
     streamlit run src/utils/dashboard.py
 
 Uses ``get_settings()`` from ``config.settings``, SQLite (read-only URI),
-``logs/app.log``, ``runtime/kill_switch_state.json``, and Alpaca
-``TradingClient`` **get_account** / **get_all_positions** only.
+``logs/app.log``, ``runtime/kill_switch_state.json``, Alpaca **market data**
+(bars + latest quotes for the Live Watchlist), and ``TradingClient``
+**get_account** / **get_all_positions** only.
 Never submits or cancels orders, never writes SQLite, never mutates kill-switch
 files.
 """
@@ -14,6 +15,7 @@ files.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import sys
 import threading
@@ -43,7 +45,7 @@ try:
 except ImportError:
     st_autorefresh = None  # type: ignore[misc, assignment]
 
-from config.settings import get_settings  # noqa: E402
+from config.settings import Settings, get_settings  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Pure helpers (safe to import from tests without running Streamlit UI)
@@ -393,6 +395,97 @@ def compute_trade_performance(df: pd.DataFrame, *, pnl_key: str = "_pnl") -> dic
     }
 
 
+# Default ETF basket when ``SYMBOLS`` is empty.
+WATCHLIST_DEFAULT_SYMBOLS: tuple[str, ...] = ("SPY", "QQQ", "IWM", "XLF", "EEM")
+
+# Live watchlist RSI uses explicit 5-minute bars (dashboard contract).
+WATCHLIST_BAR_TIMEFRAME = "5Min"
+
+_WATCHLIST_FRESH_SEC = 10 * 60
+
+_TIMEFRAME_DELTAS_WATCHLIST: dict[str, timedelta] = {
+    "1Min": timedelta(minutes=1),
+    "5Min": timedelta(minutes=5),
+    "15Min": timedelta(minutes=15),
+    "1Hour": timedelta(hours=1),
+    "1Day": timedelta(days=1),
+}
+
+
+def watchlist_symbols(settings: Settings) -> list[str]:
+    """Prefer ``Settings.symbols_list``; otherwise static five-symbol basket."""
+
+    raw = [s.strip().upper() for s in settings.symbols_list if s.strip()]
+    return raw if raw else list(WATCHLIST_DEFAULT_SYMBOLS)
+
+
+def dashboard_drop_inprogress_bar(bars: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """Exclude the last bar if it is still forming (aligned with RSI strategy)."""
+
+    if bars is None or bars.empty:
+        return bars
+    delta = _TIMEFRAME_DELTAS_WATCHLIST.get(timeframe)
+    if delta is None:
+        return bars
+    try:
+        last_ts = bars.index[-1]
+        if hasattr(last_ts, "to_pydatetime"):
+            last_dt = last_ts.to_pydatetime()
+        elif isinstance(last_ts, datetime):
+            last_dt = last_ts
+        else:
+            return bars
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=UTC)
+        if datetime.now(UTC) < last_dt + delta:
+            return bars.iloc[:-1]
+    except (IndexError, AttributeError, TypeError):
+        return bars
+    return bars
+
+
+def watchlist_rsi_signal_label(
+    rsi_val: float | None,
+    *,
+    rsi_ready: bool,
+    oversold: float,
+    overbought: float,
+) -> str:
+    if not rsi_ready or rsi_val is None or not math.isfinite(rsi_val):
+        return "Warming Up"
+    if rsi_val < oversold:
+        return "Oversold"
+    if rsi_val > overbought:
+        return "Overbought"
+    return "Neutral"
+
+
+def watchlist_bar_freshness_label(last_bar_ts: datetime | None) -> str:
+    if last_bar_ts is None:
+        return "Unknown"
+    try:
+        ts = last_bar_ts
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        age_s = (datetime.now(UTC) - ts).total_seconds()
+    except (TypeError, ValueError, OSError):
+        return "Unknown"
+    if age_s <= _WATCHLIST_FRESH_SEC:
+        return "🟢 Fresh"
+    return "🟡 Stale"
+
+
+def watchlist_spread_pct_cell(bid: float, ask: float) -> str:
+    from utils.price_utils import spread_pct as _sp_pct  # noqa: PLC0415
+
+    try:
+        if bid <= 0 or ask <= bid:
+            return "—"
+        return f"{_sp_pct(bid, ask) * 100:.4f}%"
+    except ValueError:
+        return "—"
+
+
 def read_kill_switch_latched(state_dir: Path) -> Optional[bool]:
     """Read latch from ``kill_switch_state.json`` (multiple keys, read-only)."""
 
@@ -516,6 +609,102 @@ def _position_to_row(
 # ---------------------------------------------------------------------------
 # Streamlit caches (Alpaca read-only)
 # ---------------------------------------------------------------------------
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_watchlist_rows(
+    symbols_tuple: tuple[str, ...],
+    rsi_length: int,
+    rsi_oversold_threshold: float,
+    rsi_overbought_threshold: float,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Load latest 5-minute bars + quotes; compute RSI using completed bars only."""
+
+    from core.alpaca_clients import build_alpaca_clients  # noqa: PLC0415
+    from core.market_data import BarFetcher  # noqa: PLC0415
+    from strategies.indicators import rsi as rsi_indicator  # noqa: PLC0415
+
+    rows: list[dict[str, Any]] = []
+    try:
+        settings = get_settings()
+    except Exception as exc:
+        return [], str(exc)
+
+    try:
+        clients = build_alpaca_clients(settings)
+    except Exception as exc:
+        return [], f"Alpaca client build failed: {exc}"
+
+    fetcher = BarFetcher(
+        clients.historical_data,
+        feed=clients.resolved_feed,
+        max_attempts=settings.RETRY_MAX_ATTEMPTS,
+        base_delay=settings.RETRY_BASE_DELAY_SECONDS,
+        max_delay=settings.RETRY_MAX_DELAY_SECONDS,
+    )
+
+    min_bars = max(50, int(rsi_length) + 25)
+    rsi_min_samples = int(rsi_length) + 5
+
+    for sym in symbols_tuple:
+        sym_u = sym.strip().upper()
+        try:
+            df_raw = fetcher.fetch_bars(sym_u, WATCHLIST_BAR_TIMEFRAME, lookback_bars=min_bars)
+            df_done = dashboard_drop_inprogress_bar(df_raw, WATCHLIST_BAR_TIMEFRAME)
+            if df_done is None or df_done.empty:
+                raise ValueError("empty bars")
+
+            close = df_done["close"].astype(float)
+            rsi_series = rsi_indicator(close, length=int(rsi_length))
+            rsi_last = float(rsi_series.iloc[-1])
+            rsi_ready = len(df_done) >= rsi_min_samples and not pd.isna(rsi_last)
+
+            last_ix = df_done.index[-1]
+            ts = pd.Timestamp(last_ix)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            ts_parsed = ts.to_pydatetime()
+            last_bar_iso = ts.strftime("%Y-%m-%d %H:%M:%S UTC")
+            freshness = watchlist_bar_freshness_label(ts_parsed)
+
+            quote = fetcher.fetch_latest_quote(sym_u)
+            spr = watchlist_spread_pct_cell(quote.bid, quote.ask)
+            px = float(close.iloc[-1])
+
+            rsi_cell = "Warming Up" if not rsi_ready else f"{rsi_last:.2f}"
+            signal = watchlist_rsi_signal_label(
+                rsi_last,
+                rsi_ready=rsi_ready,
+                oversold=float(rsi_oversold_threshold),
+                overbought=float(rsi_overbought_threshold),
+            )
+            rows.append(
+                {
+                    "Symbol": sym_u,
+                    "Price": f"{px:.4f}",
+                    "RSI": rsi_cell,
+                    "Signal Status": signal,
+                    "Latest Bar Time": last_bar_iso,
+                    "Freshness": freshness,
+                    "Spread %": spr,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - row-level degrade
+            rows.append(
+                {
+                    "Symbol": sym_u,
+                    "Price": "—",
+                    "RSI": "—",
+                    "Signal Status": "🔴 Error",
+                    "Latest Bar Time": "—",
+                    "Freshness": "🔴 Error",
+                    "Spread %": "—",
+                },
+            )
+
+    return rows, None
 
 
 @st.cache_resource(show_spinner=False)
@@ -688,10 +877,6 @@ def main() -> None:
     )
     _inject_theme_css()
 
-    if st_autorefresh is not None:
-        st_autorefresh(interval=10_000, key="cmd_center_refresh")
-
-    refresh_clicked = False
     try:
         settings = get_settings()
     except Exception as exc:
@@ -699,7 +884,46 @@ def main() -> None:
         st.caption(str(type(exc).__name__))
         return
 
-    # Resolve paths relative to cwd (matches ``main.py`` behaviour)
+    sidebar = st.sidebar
+    sidebar.header("Session")
+    sidebar.caption("`get_settings()` → same `.env` as the bot.")
+
+    refresh_seconds = sidebar.slider(
+        "Watchlist auto-refresh interval (seconds)",
+        min_value=10,
+        max_value=120,
+        value=30,
+        step=5,
+        help="Drives `streamlit-autorefresh` rerun cadence.",
+    )
+    if st_autorefresh is not None:
+        st_autorefresh(interval=int(refresh_seconds) * 1000, key="watchlist_refresh")
+        sidebar.caption(f"Auto-refresh: **{refresh_seconds}s** (`watchlist_refresh`).")
+    else:
+        sidebar.info(
+            "Install **`streamlit-autorefresh`** for automatic watchlist refresh: "
+            "`pip install streamlit-autorefresh`",
+        )
+
+    refresh_clicked = sidebar.button("Refresh now", use_container_width=True)
+    if refresh_clicked:
+        load_account_snapshot.clear()
+        load_open_positions_rows.clear()
+        load_db_trade_payload.clear()
+        fetch_watchlist_rows.clear()
+        try:
+            _cached_trading_client.clear()
+        except Exception:
+            pass
+        st.rerun()
+
+    trade_source_scope = sidebar.selectbox(
+        "SQLite daily / risk scope",
+        options=["live", "simulation", "all"],
+        index=0,
+    )
+
+    is_paper = settings.is_paper
     raw_db = Path(settings.DATABASE_PATH)
     resolved_db = (
         raw_db.expanduser().resolve()
@@ -720,31 +944,6 @@ def main() -> None:
     )
     app_log_path = log_dir / "app.log"
 
-    sidebar = st.sidebar
-    sidebar.header("Session")
-    sidebar.caption("`get_settings()` → same `.env` as the bot.")
-
-    refresh_iv = sidebar.slider("Refresh target (Alpaca TTL = 10s)", 5, 60, 10)
-    sidebar.caption("Page auto‑reruns about every 10s when `streamlit-autorefresh` is installed.")
-
-    refresh_clicked = sidebar.button("Refresh now", use_container_width=True)
-    if refresh_clicked:
-        load_account_snapshot.clear()
-        load_open_positions_rows.clear()
-        load_db_trade_payload.clear()
-        try:
-            _cached_trading_client.clear()
-        except Exception:
-            pass
-        st.rerun()
-
-    trade_source_scope = sidebar.selectbox(
-        "SQLite daily / risk scope",
-        options=["live", "simulation", "all"],
-        index=0,
-    )
-
-    is_paper = settings.is_paper
     env_label = "PAPER" if is_paper else "LIVE"
     dry_txt = "true" if settings.DRY_RUN else "false"
 
@@ -762,6 +961,20 @@ def main() -> None:
     sidebar.write(f"- `DRY_RUN`: **{dry_txt}**")
     sidebar.write(f"- Kill switch: {ks_display}")
     sidebar.write(f"- DB file: {'OK' if db_exists else 'missing'}")
+    sidebar.markdown("**Spread filter**")
+    sidebar.caption(
+        f"- Default `SPREAD_FILTER_PCT`: **{settings.SPREAD_FILTER_PCT:.6f}** "
+        f"(~{settings.SPREAD_FILTER_PCT * 10000:.2f} bps)",
+    )
+    if settings.SPREAD_FILTER_PCT_IEX is not None:
+        iex_v = float(settings.SPREAD_FILTER_PCT_IEX)
+        sidebar.caption(
+            f"- IEX quotes use `SPREAD_FILTER_PCT_IEX`: **{iex_v:.6f}** (~{iex_v * 10000:.2f} bps)",
+        )
+    else:
+        sidebar.caption(
+            "- IEX override unset — same max spread for all feeds (set `SPREAD_FILTER_PCT_IEX` if IEX quotes skip too often).",
+        )
     sidebar.markdown("**Paths**")
     sidebar.caption(f"Database: `{_fmt_path(resolved_db)}`")
     sidebar.caption(f"Logs: `{_fmt_path(log_dir)}`")
@@ -772,11 +985,6 @@ def main() -> None:
     except OSError:
         log_mtime = "N/A"
     sidebar.caption(f"Last `app.log` write (mtime): **{log_mtime}**")
-
-    if st_autorefresh is None:
-        sidebar.info(
-            "Optional: `pip install streamlit-autorefresh` for automatic ~10s refresh.",
-        )
 
     now_iso = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -922,6 +1130,33 @@ def main() -> None:
 
     st.markdown("---")
 
+    # --- Live Watchlist (market data + RSI; no SQLite trades required) ---
+    st.subheader("Live Watchlist")
+    syms_wl = tuple(watchlist_symbols(settings))
+    wl_rows, wl_err = fetch_watchlist_rows(
+        syms_wl,
+        int(settings.RSI_LENGTH),
+        float(settings.RSI_OVERSOLD),
+        70.0,
+    )
+    st.caption(
+        f"5-minute bars · RSI length **{settings.RSI_LENGTH}** · "
+        f"signals: **below {settings.RSI_OVERSOLD:.0f}** = Oversold, **above 70** = Overbought · "
+        f"{', '.join(syms_wl)}",
+    )
+    if wl_err:
+        st.warning(f"Live Watchlist unavailable: {wl_err}")
+    elif wl_rows:
+        st.dataframe(pd.DataFrame(wl_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No watchlist rows.")
+
+    st.caption(
+        "Watchlist data updates automatically. This dashboard is read-only and does not place trades.",
+    )
+
+    st.markdown("---")
+
     # --- Charts ---
     c1, c2 = st.columns(2)
 
@@ -1029,7 +1264,8 @@ def main() -> None:
 
     st.caption(
         "Read-only Command Center · no orders · no DB writes · no kill-switch mutations. "
-        "Alpaca cache TTL ~10s · SQLite cache TTL ~3s · auto-refresh ~10s when streamlit-autorefresh is installed.",
+        f"Account/positions cache TTL ~10s · SQLite cache ~3s · watchlist/bar cache TTL ~30s · "
+        f"page auto-rerun ~**{refresh_seconds}s** when `streamlit-autorefresh` is installed.",
     )
 
 

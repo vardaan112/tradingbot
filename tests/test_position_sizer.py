@@ -212,3 +212,26 @@ def test_sizing_block_reason_returns_zero_shares(settings):
     )
     assert out.shares == 0
     assert out.skipped_reason == reason
+
+
+def test_size_zero_reason_is_explicit_when_price_above_cap_and_no_fractionals(make_settings_factory):
+    settings = make_settings_factory(
+        MAX_EQUITY_USAGE_USD=50.0,
+        MAX_DOLLARS_PER_TRADE=50.0,
+        ENABLE_FRACTIONAL=False,
+        MIN_SHARES=1.0,
+    )
+    sizer = _build(settings)
+    account = make_account(equity=25_000.0, buying_power=25_000.0, regt=25_000.0)
+    out = sizer.size(
+        symbol="IWM",
+        entry_price=237.41,
+        atr=1.5,
+        account=account,
+        positions=[],
+        bot_managed_notional=0.0,
+    )
+    assert out.shares == 0
+    assert out.skipped_reason is not None
+    assert "SIZE_ZERO" in out.skipped_reason
+    assert "fractional_enabled=false" in out.skipped_reason

@@ -46,17 +46,19 @@ def test_spread_skip_emits_structured_log_with_required_fields(settings, caplog)
     msg = skip_lines[0]
     for needle in (
         "symbol=QQQ",
-        "bid=100.0000",
-        "ask=102.0000",
-        "mid=",
-        "spread_pct=",
-        f"spread_threshold={settings.SPREAD_FILTER_PCT:.6f}",
-        "feed=iex",
+        "code=SPREAD_TOO_WIDE",
+        "event=strategy_skip_spread",
+        "meta_bid=100.0",
+        "meta_ask=102.0",
+        "meta_mid=101.0",
+        "spread_pct=0.019802",
+        "meta_feed=iex",
         "quote_age_seconds=",
         "strategy=rsi_meanrev",
-        "timestamp=",
+        "ts=",
     ):
         assert needle in msg, f"missing {needle!r} in spread skip log: {msg}"
+    assert "spread_threshold_pct=" in msg
 
 
 def test_spread_skip_not_logged_when_eligible(settings, caplog):

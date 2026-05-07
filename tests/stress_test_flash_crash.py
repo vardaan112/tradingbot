@@ -143,4 +143,4 @@ async def test_enter_long_rejected_when_kill_switch_latched(
     orch._log_strategy.info.assert_called()
     fmt, args = orch._log_strategy.info.call_args[0][0], orch._log_strategy.info.call_args[0][1:]
     line = fmt % args if args else fmt
-    assert "kill switch latched" in line
+    assert "KILL_SWITCH_LATCHED" in line

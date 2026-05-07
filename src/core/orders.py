@@ -455,7 +455,8 @@ class OrderService:
                     reason="invalid_quote",
                 )
                 return None
-            if spread_pct(quote.bid, quote.ask) > float(self._settings.SPREAD_FILTER_PCT):
+            spread_cap = float(self._settings.spread_filter_pct_for_feed(quote.feed))
+            if spread_pct(quote.bid, quote.ask) > spread_cap:
                 self._log_chase(
                     "order_chase_giveup",
                     symbol=symbol,
