@@ -54,6 +54,10 @@ class StrategyContext:
     feed: str
     sentiment_overlay: Optional[dict[str, Any]] = field(default=None)
     qqq_regime_bear_volatile: bool = False
+    regime_anchor_state: str = "Unknown"
+    regime_anchor_rsi: Optional[float] = None
+    regime_anchor_close: Optional[float] = None
+    regime_anchor_sma: Optional[float] = None
     anti_martingale_risk_mode: Optional[str] = None
     anti_martingale_multiplier: Optional[float] = None
     recent_trade_outcomes_hint: str = ""

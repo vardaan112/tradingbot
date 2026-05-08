@@ -284,7 +284,7 @@ def emit_skip_diagnostic(
             extra={"symbol": sr.symbol, "skip_code": sr.code},
         )
 
-    if discord_enqueue is None:
+    if discord_enqueue is None or not bool(settings.DISCORD_SKIP_ALERTS_ENABLED):
         return
     cd = float(settings.SKIP_DIAGNOSTICS_DISCORD_COOLDOWN_SECONDS)
     if not throttle.allow_discord(sr.symbol, sr.code, cd):

@@ -48,6 +48,36 @@ def _stale_bars() -> pd.DataFrame:
     )
 
 
+def _fresh_one_minute_bars() -> pd.DataFrame:
+    end = datetime.now(timezone.utc) - timedelta(seconds=30)
+    idx = pd.date_range(end=end, periods=3, freq="1min")
+    close = pd.Series([100.0, 100.2, 100.1], index=idx)
+    return pd.DataFrame(
+        {
+            "open": close.shift(1).fillna(close.iloc[0]),
+            "high": close + 0.10,
+            "low": close - 0.10,
+            "close": close,
+            "volume": pd.Series([10_000.0] * len(idx), index=idx),
+        },
+    )
+
+
+def _fresh_five_minute_bars(rows: int = 200) -> pd.DataFrame:
+    end = datetime.now(timezone.utc) - timedelta(minutes=5)
+    idx = pd.date_range(end=end, periods=rows, freq="5min")
+    close = pd.Series([100.0] * len(idx), index=idx)
+    return pd.DataFrame(
+        {
+            "open": close,
+            "high": close + 0.10,
+            "low": close - 0.10,
+            "close": close,
+            "volume": pd.Series([100_000.0] * len(idx), index=idx),
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_tick_emits_stale_bars_skip_before_strategy_eval(monkeypatch, make_settings_factory, tmp_path):
     settings = make_settings_factory(
@@ -134,3 +164,66 @@ async def test_tick_emits_stale_bars_skip_before_strategy_eval(monkeypatch, make
 
     assert "STALE_BARS" in emitted_codes
     assert not strategy_eval_calls
+
+
+def test_quote_fallback_uses_recent_healthy_bar(make_settings_factory, tmp_path):
+    settings = make_settings_factory(
+        SYMBOLS="AMD",
+        QUOTE_FALLBACK_ENABLED=True,
+        QUOTE_MAX_AGE_SECONDS=3.0,
+        QUOTE_FALLBACK_MAX_BAR_AGE_SECONDS=90.0,
+        QUOTE_FALLBACK_USE_BAR_MIDPOINT=True,
+        STATE_DIR=str(tmp_path / "st"),
+        LOG_DIR=str(tmp_path / "logs"),
+        DATABASE_PATH=str(tmp_path / "db.sqlite"),
+    )
+    orch = Orchestrator(settings)
+    now = datetime.now(timezone.utc)
+    stale_quote = Quote(
+        symbol="AMD",
+        bid=100.0,
+        ask=100.20,
+        bid_size=10.0,
+        ask_size=10.0,
+        timestamp=now - timedelta(seconds=10),
+        feed="iex",
+    )
+
+    out = orch._quote_with_bar_fallback(  # type: ignore[attr-defined]
+        "AMD",
+        stale_quote,
+        _fresh_one_minute_bars(),
+        now_eval=now,
+    )
+
+    assert out is not None
+    assert out.feed == "iex"
+    assert out.bid > 0
+    assert out.ask > out.bid
+    assert out.age_seconds(reference=now) == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_recover_missing_bars_backfills_symbol(make_settings_factory, tmp_path):
+    settings = make_settings_factory(
+        SYMBOLS="SQ",
+        STATE_DIR=str(tmp_path / "st"),
+        LOG_DIR=str(tmp_path / "logs"),
+        DATABASE_PATH=str(tmp_path / "db.sqlite"),
+    )
+    orch = Orchestrator(settings)
+    recovered = _fresh_five_minute_bars()
+    calls: list[tuple[str, str, int]] = []
+
+    class _Fetcher:
+        def fetch_bars(self, symbol: str, timeframe: str, *, lookback_bars: int):
+            calls.append((symbol, timeframe, lookback_bars))
+            return recovered
+
+    orch._bar_fetcher = _Fetcher()  # type: ignore[assignment]
+
+    out = await orch._recover_missing_bars("SQ")  # type: ignore[attr-defined]
+
+    assert not out.empty
+    assert orch._bars_cache["SQ"] is recovered
+    assert calls == [("SQ", settings.BAR_TIMEFRAME, max(200, orch._strategy.warmup_lookback()))]

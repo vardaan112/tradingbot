@@ -101,6 +101,7 @@ from strategies.universe import UniverseFilter
 from services.regime_detector import QqqRegimeDetector
 from utils.tearsheet import tearsheet_primary
 from utils.time_utils import now_eastern, now_utc, today_eastern
+from utils.price_utils import round_to_tick, tick_size_for
 
 from .autotune import iso_week_token, run_autotune_job
 from .heartbeat import HeartbeatService
@@ -924,9 +925,12 @@ class Orchestrator:
                 continue
             self._warmup_symbol_if_needed(sym)
             bars = self._refresh_symbol_bars(sym)
+            if bars is None or bars.empty:
+                bars = await self._recover_missing_bars(sym)
             quote = self._quote_cache.get(sym)
             if quote is None or not quote.is_fresh(self._settings.QUOTE_STALENESS_SECONDS):
                 quote = self._rest_quote(sym)
+            quote = self._quote_with_bar_fallback(sym, quote, bars, now_eval=now_utc())
 
             now_eval = now_utc()
             latest_bar_ts = self._latest_bar_timestamp(bars)
@@ -1038,6 +1042,18 @@ class Orchestrator:
                 recent_trade_outcomes_hint=t_preview,
                 qqq_regime_bear_volatile=bool(
                     self._regime_detector.snapshot.bear_volatile if self._regime_detector else False
+                ),
+                regime_anchor_state=(
+                    self._regime_detector.snapshot.anchor_state if self._regime_detector else "Unknown"
+                ),
+                regime_anchor_rsi=(
+                    self._regime_detector.snapshot.anchor_rsi if self._regime_detector else None
+                ),
+                regime_anchor_close=(
+                    self._regime_detector.snapshot.anchor_close if self._regime_detector else None
+                ),
+                regime_anchor_sma=(
+                    self._regime_detector.snapshot.anchor_sma if self._regime_detector else None
                 ),
             )
 
@@ -2108,6 +2124,60 @@ class Orchestrator:
             lookback_bars=lookback,
         )
 
+    async def _recover_missing_bars(self, symbol: str) -> pd.DataFrame:
+        """Force a one-symbol backfill when the normal cache refresh returns no bars."""
+
+        sym = symbol.upper()
+        lookback = max(200, int(self._strategy.warmup_lookback()))
+        self._log_strategy.warning(
+            "event=data_recovery_start symbol=%s reason=bar_rows_0 timeframe=%s lookback_bars=%s",
+            sym,
+            self._settings.BAR_TIMEFRAME,
+            lookback,
+            extra={"symbol": sym, "skip_code": SkipCodes.MISSING_BARS},
+        )
+        if self._bar_fetcher is None:
+            self._log_strategy.warning(
+                "event=data_recovery_failed symbol=%s reason=no_bar_fetcher",
+                sym,
+                extra={"symbol": sym, "skip_code": SkipCodes.MISSING_BARS},
+            )
+            return pd.DataFrame()
+        try:
+            df = await asyncio.to_thread(
+                self._bar_fetcher.fetch_bars,
+                sym,
+                self._settings.BAR_TIMEFRAME,
+                lookback_bars=lookback,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_strategy.warning(
+                "event=data_recovery_failed symbol=%s reason=fetch_error err=%s",
+                sym,
+                exc,
+                extra={"symbol": sym, "skip_code": SkipCodes.MISSING_BARS},
+            )
+            return pd.DataFrame()
+        if df is None or df.empty:
+            self._log_strategy.warning(
+                "event=data_recovery_failed symbol=%s reason=no_bars_returned",
+                sym,
+                extra={"symbol": sym, "skip_code": SkipCodes.MISSING_BARS},
+            )
+            self._bars_cache[sym] = pd.DataFrame()
+            return self._bars_cache[sym]
+        self._bars_cache[sym] = df
+        self._log_strategy.info(
+            "event=data_recovery_success symbol=%s bar_rows=%s latest_bar_ts=%s",
+            sym,
+            len(df),
+            self._latest_bar_timestamp(df).isoformat()
+            if self._latest_bar_timestamp(df) is not None
+            else "n_a",
+            extra={"symbol": sym},
+        )
+        return df
+
     def _refresh_symbol_bars(self, symbol: str, *, force: bool = False) -> pd.DataFrame:
         sym = symbol.upper()
         current = self._bars_cache.get(sym, pd.DataFrame())
@@ -2203,6 +2273,129 @@ class Orchestrator:
             return q
         except Exception:  # noqa: BLE001
             return None
+
+    def _quote_with_bar_fallback(
+        self,
+        symbol: str,
+        quote: Quote | None,
+        bars: pd.DataFrame,
+        *,
+        now_eval: datetime,
+    ) -> Quote | None:
+        """Use recent healthy bars as a controlled fallback for bad IEX quotes."""
+
+        if not bool(self._settings.QUOTE_FALLBACK_ENABLED):
+            return quote
+
+        sym = symbol.upper()
+        quote_max_age = float(self._settings.QUOTE_STALENESS_SECONDS)
+        bad_reason = ""
+        if quote is None:
+            bad_reason = "missing_quote"
+        else:
+            try:
+                q_age = float(quote.age_seconds(reference=now_eval))
+            except (TypeError, ValueError):
+                q_age = float("inf")
+            if quote.bid <= 0 or quote.ask <= quote.bid:
+                bad_reason = "invalid_quote"
+            elif q_age > quote_max_age:
+                bad_reason = f"stale_quote:{q_age:.3f}>{quote_max_age:.3f}"
+
+        if not bad_reason:
+            return quote
+
+        fallback_bars = bars
+        tf = str(self._settings.QUOTE_FALLBACK_BAR_TIMEFRAME)
+        if self._bar_fetcher is not None:
+            with contextlib.suppress(Exception):
+                fallback_bars = self._bar_fetcher.fetch_bars(sym, tf, lookback_bars=3)
+        if fallback_bars is None or fallback_bars.empty:
+            self._log_strategy.info(
+                "event=quote_fallback_skip symbol=%s skip_code=skip_stale_quote reason=%s fallback_reason=no_bars",
+                sym,
+                bad_reason,
+                extra={"symbol": sym, "skip_code": SkipCodes.SKIP_STALE_QUOTE},
+            )
+            return quote
+
+        latest_ts = self._latest_bar_timestamp(fallback_bars)
+        bar_age = (
+            max(0.0, float((now_eval - latest_ts).total_seconds()))
+            if latest_ts is not None
+            else None
+        )
+        max_bar_age = float(self._settings.QUOTE_FALLBACK_MAX_BAR_AGE_SECONDS)
+        if bar_age is None or bar_age > max_bar_age:
+            self._log_strategy.info(
+                "event=quote_fallback_skip symbol=%s skip_code=skip_stale_quote reason=%s "
+                "fallback_reason=bar_stale bar_age_seconds=%s max_bar_age_seconds=%.3f",
+                sym,
+                bad_reason,
+                f"{bar_age:.3f}" if bar_age is not None else "n_a",
+                max_bar_age,
+                extra={"symbol": sym, "skip_code": SkipCodes.SKIP_STALE_QUOTE},
+            )
+            return quote
+
+        try:
+            last = fallback_bars.iloc[-1]
+            high = float(last["high"])
+            low = float(last["low"])
+            close = float(last["close"])
+            volume = float(last.get("volume", 0.0))
+        except (KeyError, TypeError, ValueError, IndexError):
+            return quote
+        healthy = close > 0 and high >= low > 0 and low <= close <= high and volume > 0
+        if not healthy and bool(self._settings.ELASTIC_SPREAD_REQUIRE_BAR_HEALTH):
+            self._log_strategy.info(
+                "event=quote_fallback_skip symbol=%s skip_code=skip_stale_quote reason=%s "
+                "fallback_reason=bar_unhealthy high=%.6f low=%.6f close=%.6f volume=%.0f",
+                sym,
+                bad_reason,
+                high,
+                low,
+                close,
+                volume,
+                extra={"symbol": sym, "skip_code": SkipCodes.SKIP_STALE_QUOTE},
+            )
+            return quote
+
+        midpoint = ((high + low) / 2.0) if self._settings.QUOTE_FALLBACK_USE_BAR_MIDPOINT else close
+        if midpoint <= 0:
+            return quote
+        tick = tick_size_for(midpoint)
+        bid = round_to_tick(max(tick, midpoint - tick), mode="down")
+        ask = round_to_tick(midpoint + tick, mode="up")
+        if ask <= bid:
+            ask = bid + tick
+        fallback = Quote(
+            symbol=sym,
+            bid=float(bid),
+            ask=float(ask),
+            bid_size=0.0,
+            ask_size=0.0,
+            timestamp=now_eval,
+            feed="iex",
+        )
+        if self._quote_cache is not None:
+            self._quote_cache.set_quote(fallback)
+        self._log_strategy.info(
+            "event=quote_fallback_used symbol=%s reason=%s source_timeframe=%s "
+            "bar_ts=%s bar_age_seconds=%.3f bid=%.6f ask=%.6f mid=%.6f close=%.6f volume=%.0f",
+            sym,
+            bad_reason,
+            tf,
+            latest_ts.isoformat() if latest_ts is not None else "n_a",
+            float(bar_age),
+            fallback.bid,
+            fallback.ask,
+            midpoint,
+            close,
+            volume,
+            extra={"symbol": sym, "skip_code": "quote_fallback_used"},
+        )
+        return fallback
 
     def _maybe_correlation_block(self, symbol: str) -> str | None:
         if not self._settings.CORRELATION_BREAKER_ENABLED or self._bar_fetcher is None:

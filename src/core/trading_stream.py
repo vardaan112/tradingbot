@@ -26,6 +26,32 @@ from config.constants import DEFAULT_WS_RECONNECT_MAX_DELAY, LOGGER_STREAM
 
 OrderEventHandler = Callable[[Any], Awaitable[None]]
 QuoteEventHandler = Callable[[Any], Awaitable[None]]
+FatalStreamHandler = Callable[[BaseException], None]
+
+
+def is_connection_limit_exceeded(exc: BaseException) -> bool:
+    """Detect Alpaca websocket auth/session-limit failures across wrappers."""
+
+    seen: set[int] = set()
+    stack: list[BaseException] = [exc]
+    while stack:
+        cur = stack.pop()
+        cid = id(cur)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        text = f"{type(cur).__name__}: {cur}".lower()
+        if "connection limit exceeded" in text:
+            return True
+        if "429" in text and "connection" in text and "limit" in text:
+            return True
+        cause = getattr(cur, "__cause__", None)
+        ctx = getattr(cur, "__context__", None)
+        if isinstance(cause, BaseException):
+            stack.append(cause)
+        if isinstance(ctx, BaseException):
+            stack.append(ctx)
+    return False
 
 
 class StreamHealth:
@@ -145,6 +171,7 @@ class TradingStreamRunner:
         on_trade_update: OrderEventHandler,
         on_quote: QuoteEventHandler,
         health: StreamHealth,
+        on_fatal_error: FatalStreamHandler | None = None,
     ) -> None:
         self._trading_stream = trading_stream
         self._market_stream = market_stream
@@ -153,9 +180,15 @@ class TradingStreamRunner:
         self._on_trade_update = on_trade_update
         self._on_quote = on_quote
         self._health = health
+        self._on_fatal_error = on_fatal_error
+        self._fatal_error: BaseException | None = None
         self._tasks: list[asyncio.Task[Any]] = []
         self._stop_event = asyncio.Event()
         self._log = logging.getLogger(LOGGER_STREAM)
+
+    @property
+    def fatal_error(self) -> BaseException | None:
+        return self._fatal_error
 
     async def start(self) -> None:
         """Subscribe to streams and run them under supervision."""
@@ -200,18 +233,7 @@ class TradingStreamRunner:
             (self._trading_stream, "trading"),
             (self._market_stream, "market"),
         ):
-            try:
-                stop_ws = getattr(stream, "stop_ws", None)
-                if stop_ws is not None:
-                    await stop_ws()
-                else:
-                    close_fn = getattr(stream, "close", None)
-                    if close_fn is not None:
-                        res = close_fn()
-                        if asyncio.iscoroutine(res):
-                            await res
-            except Exception as exc:  # noqa: BLE001
-                self._log.warning("Error stopping %s stream: %s", label, exc)
+            await self._close_stream(stream, label)
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
@@ -222,6 +244,31 @@ class TradingStreamRunner:
         self._tasks.clear()
         self._health.set_trading_ok(False)
         self._health.set_market_ok(False)
+
+    async def _close_stream(self, stream: Any, label: str) -> None:
+        self._log.warning("event=websocket_shutdown_initiated stream=%s", label)
+        for method_name in ("stop_ws", "stop", "close"):
+            close_fn = getattr(stream, method_name, None)
+            if close_fn is None:
+                continue
+            try:
+                res = close_fn()
+                if asyncio.iscoroutine(res):
+                    await res
+                self._log.info(
+                    "event=websocket_shutdown_completed stream=%s method=%s",
+                    label,
+                    method_name,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(
+                    "event=websocket_shutdown_error stream=%s method=%s err=%s",
+                    label,
+                    method_name,
+                    exc,
+                )
+        self._log.warning("event=websocket_shutdown_noop stream=%s reason=no_close_method", label)
 
     # ---- handlers ---------------------------------------------------------
 
@@ -275,6 +322,19 @@ class TradingStreamRunner:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
+                if is_connection_limit_exceeded(exc):
+                    self._fatal_error = exc
+                    self._stop_event.set()
+                    self._health.set_trading_ok(False)
+                    self._health.set_market_ok(False)
+                    self._log.critical(
+                        "event=alpaca_connection_limit_exceeded stream=%s err=%s",
+                        label,
+                        exc,
+                    )
+                    if self._on_fatal_error is not None:
+                        self._on_fatal_error(exc)
+                    return
                 self._log.error(
                     "%s stream crashed: %s. Reconnecting in %.2fs.", label, exc, backoff
                 )

@@ -328,6 +328,40 @@ class RSIMeanReversionStrategy(Strategy):
         tier = "HIGH_VOL" if high_vol else "NORMAL_VOL"
         return threshold, atr_pct, tier, None
 
+    def _apply_regime_adaptive_rsi(
+        self,
+        *,
+        current_threshold: float,
+        ctx: StrategyContext,
+    ) -> tuple[float, str, dict[str, object]]:
+        """Apply macro-regime RSI threshold override when anchor data is available."""
+
+        if not bool(self._settings.REGIME_ADAPTIVE_RSI_ENABLED):
+            return current_threshold, "disabled", {}
+        state = str(getattr(ctx, "regime_anchor_state", "Unknown") or "Unknown")
+        anchor_rsi = getattr(ctx, "regime_anchor_rsi", None)
+        anchor_close = getattr(ctx, "regime_anchor_close", None)
+        anchor_sma = getattr(ctx, "regime_anchor_sma", None)
+
+        if state in {"ParabolicBull", "Bull"}:
+            threshold = float(self._settings.RSI_OVERSOLD_BULL)
+        elif state == "Bear":
+            threshold = float(self._settings.RSI_OVERSOLD_BEAR)
+        elif state == "Neutral":
+            threshold = float(self._settings.RSI_OVERSOLD_NEUTRAL)
+        else:
+            threshold = float(self._settings.RSI_OVERSOLD_DEFAULT)
+            state = "Default"
+        return threshold, state, {
+            "regime_adaptive_rsi_enabled": True,
+            "regime_anchor_symbol": str(self._settings.REGIME_ANCHOR_SYMBOL).upper(),
+            "regime_anchor_state": state,
+            "regime_anchor_rsi": anchor_rsi,
+            "regime_anchor_close": anchor_close,
+            "regime_anchor_sma": anchor_sma,
+            "rsi_threshold_pre_regime": current_threshold,
+        }
+
     def _bollinger_snapshot(self, bars: pd.DataFrame) -> dict[str, float | bool] | None:
         basis, upper, lower, width = bollinger_bands(
             bars["close"],
@@ -917,6 +951,13 @@ class RSIMeanReversionStrategy(Strategy):
             last_close=last_close,
             atr_ratio_override=dynamic_atr_ratio,
         )
+        pre_regime_rsi_threshold = float(rsi_entry_threshold)
+        regime_rsi_state = "disabled"
+        regime_rsi_meta: dict[str, object] = {}
+        rsi_entry_threshold, regime_rsi_state, regime_rsi_meta = self._apply_regime_adaptive_rsi(
+            current_threshold=pre_regime_rsi_threshold,
+            ctx=ctx,
+        )
         rsi_triggered = bool(last_rsi < rsi_entry_threshold)
         aggressive_mode = bool(self._settings.AGGRESSIVE_MODE)
         aggressive_bypass_threshold = float(self._settings.AGGRESSIVE_RSI_BYPASS_THRESHOLD)
@@ -925,7 +966,8 @@ class RSIMeanReversionStrategy(Strategy):
         self._log.info(
             "event=strategy_volatility_gate code=%s symbol=%s sector=%s price=%.4f atr=%.6f "
             "atr_pct=%.6f atr_mean=%s atr_ratio=%s dynamic_rsi_enabled=%s "
-            "volatility_tier=%s rsi=%.4f rsi_threshold=%.4f triggered=%s",
+            "volatility_tier=%s rsi=%.4f rsi_threshold=%.4f "
+            "pre_regime_rsi_threshold=%.4f regime_rsi_state=%s triggered=%s",
             SkipCodes.VOLATILITY_THRESHOLD_USED,
             symbol,
             sector,
@@ -938,6 +980,8 @@ class RSIMeanReversionStrategy(Strategy):
             volatility_tier,
             last_rsi,
             rsi_entry_threshold,
+            pre_regime_rsi_threshold,
+            regime_rsi_state,
             str(rsi_triggered).lower(),
             extra={"symbol": symbol, "strategy": self.name},
         )
@@ -970,6 +1014,8 @@ class RSIMeanReversionStrategy(Strategy):
             "dynamic_atr_long_length": int(self._settings.DYNAMIC_RSI_LONG_ATR),
             "volatility_tier": volatility_tier,
             "rsi_threshold_used": rsi_entry_threshold,
+            "rsi_threshold_pre_regime": pre_regime_rsi_threshold,
+            **regime_rsi_meta,
             "rsi_triggered": rsi_triggered,
             "aggressive_mode": aggressive_mode,
             "aggressive_rsi_bypass_threshold": aggressive_bypass_threshold,

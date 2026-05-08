@@ -223,7 +223,10 @@ async def _amain() -> int:
         "bollinger_enabled=%s bollinger_bw_min=%.6f bollinger_require_touch=%s "
         "dynamic_rsi_enabled=%s dynamic_rsi_base=%.4f dynamic_rsi_short_atr=%s "
         "dynamic_rsi_long_atr=%s adx_low=%.4f adx_high=%.4f time_filter_enabled=%s "
-        "trade_start_et=%s trade_end_et=%s enable_fractional=%s min_order_dollars=%.2f",
+        "trade_start_et=%s trade_end_et=%s enable_fractional=%s min_order_dollars=%.2f "
+        "elastic_spread_enabled=%s iex_spread_cap=%.6f elastic_hard_max=%.6f "
+        "quote_fallback_enabled=%s quote_max_age=%.3f regime_adaptive_rsi=%s "
+        "regime_anchor=%s discord_skip_alerts=%s log_all_pretrade_skips=%s",
         ",".join(orch_syms),
         str(settings.VWAP_STRATEGY_ENABLED).lower(),
         float(settings.VWAP_Z_THRESHOLD),
@@ -241,6 +244,15 @@ async def _amain() -> int:
         settings.TIME_OF_DAY_TRADE_END,
         str(settings.ENABLE_FRACTIONAL).lower(),
         float(settings.MIN_ORDER_DOLLARS),
+        str(settings.SPREAD_FILTER_ELASTIC_ENABLED).lower(),
+        float(settings.spread_filter_pct_for_feed("iex")),
+        float(settings.SPREAD_FILTER_MAX_PCT),
+        str(settings.QUOTE_FALLBACK_ENABLED).lower(),
+        float(settings.QUOTE_STALENESS_SECONDS),
+        str(settings.REGIME_ADAPTIVE_RSI_ENABLED).lower(),
+        str(settings.REGIME_ANCHOR_SYMBOL).upper(),
+        str(settings.DISCORD_SKIP_ALERTS_ENABLED).lower(),
+        str(settings.LOG_ALL_PRETRADE_SKIPS).lower(),
         extra={"symbols": ",".join(orch_syms)},
     )
 

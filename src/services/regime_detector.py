@@ -11,7 +11,7 @@ import pandas as pd
 
 from config.constants import LOGGER_APP
 from config.settings import Settings
-from strategies.indicators import atr
+from strategies.indicators import atr, rsi
 
 if TYPE_CHECKING:
     from core.market_data import BarFetcher
@@ -27,6 +27,11 @@ class QqqRegimeSnapshot:
     atr_ratio: float
     updated_at: datetime
     error: str = ""
+    anchor_symbol: str = ""
+    anchor_close: float = 0.0
+    anchor_sma: float = 0.0
+    anchor_rsi: float = 0.0
+    anchor_state: str = "Unknown"
 
 
 class QqqRegimeDetector:
@@ -45,6 +50,7 @@ class QqqRegimeDetector:
             atr_ratio=1.0,
             updated_at=datetime.now(UTC),
             error="init",
+            anchor_symbol=str(settings.REGIME_ANCHOR_SYMBOL).upper(),
         )
         self._last_refresh_hour_utc: Optional[tuple[int, int, int, int]] = None
 
@@ -86,11 +92,27 @@ class QqqRegimeDetector:
             return self._snap
 
         snap = _compute_snapshot(df, self._settings, sym=sym)
+        if self._settings.REGIME_ADAPTIVE_RSI_ENABLED:
+            anchor_sym = str(self._settings.REGIME_ANCHOR_SYMBOL or sym).upper()
+            try:
+                anchor_df = (
+                    df
+                    if anchor_sym == sym and self._settings.REGIME_ANCHOR_TIMEFRAME == "1Hour"
+                    else self._bars.fetch_bars(
+                        anchor_sym,
+                        str(self._settings.REGIME_ANCHOR_TIMEFRAME),
+                        lookback_bars=max(120, int(self._settings.REGIME_SMA_PERIOD) + 20),
+                    )
+                )
+                snap = _with_anchor_metrics(anchor_df, self._settings, snap, sym=anchor_sym)
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("regime_anchor fetch failed symbol=%s err=%s", anchor_sym, exc)
         self._snap = snap
         status = "BearVolatile" if snap.bear_volatile else "Normal"
         self._log.info(
             "event=regime_detect status=%s symbol=%s close=%.4f sma50=%.4f atr1h=%.6f "
-            "atr_ma=%.6f QQQ_ATR_ratio=%.6f err=%s",
+            "atr_ma=%.6f QQQ_ATR_ratio=%.6f anchor_symbol=%s anchor_state=%s "
+            "anchor_rsi=%.4f anchor_close=%.4f anchor_sma=%.4f err=%s",
             status,
             sym,
             snap.close,
@@ -98,6 +120,11 @@ class QqqRegimeDetector:
             snap.atr1h,
             snap.atr_ma,
             snap.atr_ratio,
+            snap.anchor_symbol or "n_a",
+            snap.anchor_state,
+            snap.anchor_rsi,
+            snap.anchor_close,
+            snap.anchor_sma,
             snap.error or "n_a",
         )
         return self._snap
@@ -146,6 +173,52 @@ def _compute_snapshot(df: pd.DataFrame, settings: Settings, *, sym: str) -> QqqR
         atr_ratio=ratio,
         updated_at=ts,
         error="",
+        anchor_symbol=str(settings.REGIME_ANCHOR_SYMBOL).upper(),
+    )
+
+
+def _with_anchor_metrics(
+    df: pd.DataFrame,
+    settings: Settings,
+    snap: QqqRegimeSnapshot,
+    *,
+    sym: str,
+) -> QqqRegimeSnapshot:
+    if df is None or df.empty:
+        return snap
+    close = df["close"].astype(float)
+    if len(close) < max(int(settings.REGIME_RSI_PERIOD), int(settings.REGIME_SMA_PERIOD)) + 2:
+        return snap
+    anchor_close = float(close.iloc[-1])
+    sma_s = close.rolling(int(settings.REGIME_SMA_PERIOD), min_periods=int(settings.REGIME_SMA_PERIOD)).mean()
+    anchor_sma = float(sma_s.iloc[-1]) if not pd.isna(sma_s.iloc[-1]) else anchor_close
+    rsi_s = rsi(close, length=int(settings.REGIME_RSI_PERIOD))
+    anchor_rsi = float(rsi_s.iloc[-1]) if not pd.isna(rsi_s.iloc[-1]) else 50.0
+
+    above_sma = anchor_close >= anchor_sma
+    if above_sma and anchor_rsi >= float(settings.REGIME_PARABOLIC_RSI_MIN):
+        state = "ParabolicBull"
+    elif above_sma and anchor_rsi >= float(settings.REGIME_BULL_RSI_MIN):
+        state = "Bull"
+    elif (not above_sma) or anchor_rsi <= float(settings.REGIME_BEAR_RSI_MAX):
+        state = "Bear"
+    else:
+        state = "Neutral"
+
+    return QqqRegimeSnapshot(
+        bear_volatile=snap.bear_volatile,
+        close=snap.close,
+        sma50=snap.sma50,
+        atr1h=snap.atr1h,
+        atr_ma=snap.atr_ma,
+        atr_ratio=snap.atr_ratio,
+        updated_at=snap.updated_at,
+        error=snap.error,
+        anchor_symbol=sym.upper(),
+        anchor_close=anchor_close,
+        anchor_sma=anchor_sma,
+        anchor_rsi=anchor_rsi,
+        anchor_state=state,
     )
 
 

@@ -87,8 +87,7 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-cp .env.example .env
-# then edit .env with your Alpaca keys and settings
+# create/edit .env with your Alpaca keys and settings
 ```
 
 If you also want the dev/test extras:
@@ -120,7 +119,7 @@ Never run `DRY_RUN=false` unless you have verified Discord alerts (unless you ex
 
 ## Environment configuration (.env)
 
-The full annotated reference lives in `.env.example`. The most important keys:
+Runtime configuration is kept in `.env`. The most important keys:
 
 | Key                              | Default        | Purpose |
 |----------------------------------|----------------|---------|
@@ -263,7 +262,7 @@ Replayed dashboard rows are **synthetic audit trails** for visualization only; t
 
 ## Phase 8: Adaptive Brain & Remote Command Center
 
-All Phase 8 features default to **disabled** in code and `.env.example` (`false`).
+All Phase 8 features default to **disabled** in code and should be enabled deliberately in `.env`.
 Enable deliberately and monitor risk.
 
 ### Discord command center (`ENABLE_DISCORD_BOT`)

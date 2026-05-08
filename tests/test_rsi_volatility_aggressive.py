@@ -361,6 +361,48 @@ def test_volatility_gate_logging_includes_threshold_and_tier(
     assert "rsi_threshold=35.0000" in line
 
 
+def test_regime_adaptive_rsi_uses_anchor_state(
+    monkeypatch: pytest.MonkeyPatch,
+    make_settings_factory,
+    caplog: pytest.LogCaptureFixture,
+):
+    settings = make_settings_factory(
+        REGIME_ADAPTIVE_RSI_ENABLED=True,
+        RSI_OVERSOLD_BULL=40.0,
+        RSI_OVERSOLD_BEAR=25.0,
+        RSI_OVERSOLD_NEUTRAL=30.0,
+        RSI_OVERSOLD_DEFAULT=30.0,
+    )
+    monkeypatch.setattr("strategies.rsi_strategy.compute_regime_snapshot", lambda **_kw: _allow_regime())
+    strat = RSIMeanReversionStrategy(settings)
+    _patch_compute(monkeypatch, strat, rsi_v=28.0, atr_v=3.0)
+
+    bull_ctx = _ctx("SHOP", _bars(), _quote("SHOP"))
+    bull_ctx.regime_anchor_state = "Bull"
+    bull_ctx.regime_anchor_rsi = 65.0
+    bull_ctx.regime_anchor_close = 520.0
+    bull_ctx.regime_anchor_sma = 500.0
+    with caplog.at_level("INFO", logger="tradingbot.strategy"):
+        bull_actions = [s.action for s in strat.evaluate(bull_ctx)]
+    assert SignalAction.ENTER_LONG in bull_actions
+    line = next((r.getMessage() for r in caplog.records if "event=strategy_volatility_gate" in r.getMessage()), "")
+    assert "regime_rsi_state=Bull" in line
+    assert "rsi_threshold=40.0000" in line
+    caplog.clear()
+
+    bear_ctx = _ctx("SHOP", _bars(), _quote("SHOP"))
+    bear_ctx.regime_anchor_state = "Bear"
+    bear_ctx.regime_anchor_rsi = 42.0
+    bear_ctx.regime_anchor_close = 480.0
+    bear_ctx.regime_anchor_sma = 500.0
+    with caplog.at_level("INFO", logger="tradingbot.strategy"):
+        bear_actions = [s.action for s in strat.evaluate(bear_ctx)]
+    assert SignalAction.ENTER_LONG not in bear_actions
+    line = next((r.getMessage() for r in caplog.records if "event=strategy_volatility_gate" in r.getMessage()), "")
+    assert "regime_rsi_state=Bear" in line
+    assert "rsi_threshold=25.0000" in line
+
+
 def test_aggressive_mode_sma_bypass_cases(
     monkeypatch: pytest.MonkeyPatch,
     make_settings_factory,

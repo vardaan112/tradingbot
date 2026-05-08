@@ -26,6 +26,7 @@ from config.settings import Settings
 from core.market_data import Quote
 from utils.price_utils import is_valid_quote, mid_price, spread_pct
 
+from .indicators import atr
 from .skip_diagnostics import (
     SkipCodes,
     SkipDiagnosticsThrottle,
@@ -47,13 +48,23 @@ def compute_elastic_spread_cap(
     quote: Quote,
     ref_price: float,
     quote_age_seconds: float,
+    bars: pd.DataFrame | None = None,
 ) -> tuple[float, dict[str, Any]]:
     """Return spread cap (fraction) with elasticity metadata."""
 
     base_cap = float(settings.spread_filter_pct_for_feed(quote.feed))
     max_cap = float(settings.SPREAD_FILTER_MAX_PCT)
+    min_cap = float(settings.MIN_SPREAD_THRESHOLD_PERCENT)
     if not bool(settings.SPREAD_FILTER_ELASTIC_ENABLED):
-        return min(base_cap, max_cap), {"base_cap": base_cap, "elastic": False}
+        calculated_cap = min(base_cap, max_cap)
+        final_cap = min(max(calculated_cap, min_cap), max_cap)
+        return final_cap, {
+            "base_cap": base_cap,
+            "elastic": False,
+            "calculated_spread_cap": calculated_cap,
+            "min_spread_threshold_pct": min_cap,
+            "spread_floor_applied": final_cap > calculated_cap,
+        }
 
     mult = 1.0
     components: list[str] = []
@@ -75,13 +86,79 @@ def compute_elastic_spread_cap(
         mult *= float(settings.SPREAD_FILTER_FRESH_QUOTE_MULTIPLIER)
         components.append("fresh_quote")
 
-    elastic_cap = min(base_cap * mult, max_cap)
+    bar_health = False
+    atr_pct_value: float | None = None
+    if bars is not None and not bars.empty:
+        try:
+            last = bars.iloc[-1]
+            last_close = float(last["close"])
+            last_high = float(last["high"])
+            last_low = float(last["low"])
+            last_vol = float(last.get("volume", 0.0))
+            bar_health = (
+                last_close > 0.0
+                and last_high >= last_low > 0.0
+                and last_low <= last_close <= last_high
+                and last_vol > 0.0
+            )
+            if len(bars) >= int(settings.ATR_LENGTH) + 2:
+                atr_series = atr(
+                    bars["high"].astype(float),
+                    bars["low"].astype(float),
+                    bars["close"].astype(float),
+                    length=int(settings.ATR_LENGTH),
+                )
+                atr_last = float(atr_series.iloc[-1])
+                if not pd.isna(atr_last) and atr_last > 0.0 and last_close > 0.0:
+                    atr_pct_value = atr_last / last_close
+        except (KeyError, TypeError, ValueError, IndexError):
+            bar_health = False
+
+    if (
+        bool(settings.ELASTIC_SPREAD_BAR_CONFIRM_ENABLED)
+        and bool(settings.ELASTIC_SPREAD_REQUIRE_BAR_HEALTH)
+        and bars is not None
+        and not bars.empty
+        and not bar_health
+    ):
+        calculated_cap = min(base_cap, max_cap)
+        final_cap = min(max(calculated_cap, min_cap), max_cap)
+        return final_cap, {
+            "base_cap": base_cap,
+            "elastic": False,
+            "elastic_disabled_reason": "bar_health_failed",
+            "bar_health": bar_health,
+            "atr_pct": atr_pct_value,
+            "calculated_spread_cap": calculated_cap,
+            "min_spread_threshold_pct": min_cap,
+            "spread_floor_applied": final_cap > calculated_cap,
+        }
+
+    budget_cap = float(settings.ELASTIC_SPREAD_TARGET_PROFIT_PCT) * float(
+        settings.ELASTIC_SPREAD_MAX_COST_FRACTION,
+    )
+    cap_candidates = [base_cap * mult, max_cap, budget_cap]
+    if atr_pct_value is not None:
+        cap_candidates.append(atr_pct_value * float(settings.ELASTIC_SPREAD_ATR_MULTIPLIER))
+    calculated_cap = min(x for x in cap_candidates if x > 0)
+    elastic_cap = min(max(calculated_cap, min_cap), max_cap)
     return elastic_cap, {
         "base_cap": base_cap,
         "elastic": True,
         "elastic_mult": mult,
         "elastic_components": ",".join(components) if components else "none",
         "spread_cap_max_pct": max_cap,
+        "calculated_spread_cap": calculated_cap,
+        "min_spread_threshold_pct": min_cap,
+        "spread_floor_applied": elastic_cap > calculated_cap,
+        "spread_profit_budget_cap": budget_cap,
+        "atr_pct": atr_pct_value,
+        "atr_spread_cap": (
+            atr_pct_value * float(settings.ELASTIC_SPREAD_ATR_MULTIPLIER)
+            if atr_pct_value is not None
+            else None
+        ),
+        "bar_health": bar_health,
     }
 
 
@@ -113,12 +190,14 @@ class UniverseFilter:
         quote: Quote,
         ref_price: float,
         quote_age_seconds: float,
+        bars: pd.DataFrame | None = None,
     ) -> tuple[float, dict[str, Any]]:
         return compute_elastic_spread_cap(
             self._settings,
             quote=quote,
             ref_price=ref_price,
             quote_age_seconds=quote_age_seconds,
+            bars=bars,
         )
 
     def _log_spread_gate(
@@ -190,6 +269,8 @@ class UniverseFilter:
             )
             return EligibilityResult(False, "no_quote", SkipCodes.MISSING_QUOTE)
         max_age = float(self._settings.QUOTE_STALENESS_SECONDS)
+        strict_age = min(float(self._settings.QUOTE_STRICT_MAX_AGE_SECONDS), max_age)
+        stale_spread_multiplier = float(self._settings.QUOTE_STALE_SPREAD_MULTIPLIER)
         age = float(quote.age_seconds())
         if quote.bid <= 0 or quote.ask <= quote.bid:
             self._emit_universe_skip(
@@ -205,25 +286,6 @@ class UniverseFilter:
                 quote=quote,
             )
             return EligibilityResult(False, "quote_invalid", SkipCodes.QUOTE_INVALID)
-        if age > max_age or not is_valid_quote(
-            quote.bid,
-            quote.ask,
-            quote_age_seconds=age,
-            max_age_seconds=max_age,
-        ):
-            self._emit_universe_skip(
-                SkipReason(
-                    code=SkipCodes.QUOTE_INVALID,
-                    message="quote_stale_for_spread_validation",
-                    symbol=symbol,
-                    bid=float(quote.bid),
-                    ask=float(quote.ask),
-                    quote_age_seconds=age,
-                    metadata={"max_quote_age_seconds": max_age},
-                ),
-                quote=quote,
-            )
-            return EligibilityResult(False, "quote_invalid_or_stale", SkipCodes.QUOTE_INVALID)
 
         try:
             sp = spread_pct(quote.bid, quote.ask)
@@ -245,7 +307,65 @@ class UniverseFilter:
             quote=quote,
             ref_price=ref_price,
             quote_age_seconds=age,
+            bars=bars,
         )
+        if age > max_age or not is_valid_quote(
+            quote.bid,
+            quote.ask,
+            quote_age_seconds=age,
+            max_age_seconds=max_age,
+        ):
+            self._emit_universe_skip(
+                SkipReason(
+                    code=SkipCodes.QUOTE_INVALID,
+                    message="quote_stale_for_spread_validation",
+                    symbol=symbol,
+                    bid=float(quote.bid),
+                    ask=float(quote.ask),
+                    spread_pct=sp,
+                    spread_threshold_pct=spread_cap,
+                    quote_age_seconds=age,
+                    metadata={
+                        "max_quote_age_seconds": max_age,
+                        "strict_quote_age_seconds": strict_age,
+                        "stale_quote_spread_multiplier": stale_spread_multiplier,
+                    },
+                ),
+                quote=quote,
+            )
+            return EligibilityResult(False, "quote_invalid_or_stale", SkipCodes.QUOTE_INVALID)
+        if age > strict_age:
+            stale_spread_cap = spread_cap * stale_spread_multiplier
+            if sp > stale_spread_cap:
+                self._emit_universe_skip(
+                    SkipReason(
+                        code=SkipCodes.QUOTE_INVALID,
+                        message=(
+                            "quote_in_grace_window_but_spread_too_wide "
+                            f"age={age:.3f} spread_pct={sp:.6f} "
+                            f"grace_cap={stale_spread_cap:.6f}"
+                        ),
+                        symbol=symbol,
+                        bid=float(quote.bid),
+                        ask=float(quote.ask),
+                        spread_pct=sp,
+                        spread_threshold_pct=stale_spread_cap,
+                        quote_age_seconds=age,
+                        metadata={
+                            "base_spread_threshold_pct": spread_cap,
+                            "max_quote_age_seconds": max_age,
+                            "strict_quote_age_seconds": strict_age,
+                            "stale_quote_spread_multiplier": stale_spread_multiplier,
+                        },
+                    ),
+                    quote=quote,
+                )
+                return EligibilityResult(False, "stale_quote_spread_too_wide", SkipCodes.QUOTE_INVALID)
+            cap_meta["stale_quote_grace_used"] = True
+            cap_meta["base_spread_threshold_pct"] = spread_cap
+            cap_meta["strict_quote_age_seconds"] = strict_age
+            cap_meta["stale_quote_spread_multiplier"] = stale_spread_multiplier
+            spread_cap = stale_spread_cap
         cap_meta["feed"] = str(quote.feed or "").lower()
         cap_meta["quote_age_seconds"] = age
         cap_meta["reference_price"] = ref_price
@@ -278,6 +398,7 @@ class UniverseFilter:
                         "ask": quote.ask,
                         "mid": mid_v,
                         "feed": quote.feed,
+                        "skip_code_short": "skip_spread_too_wide",
                         **cap_meta,
                     },
                 ),
@@ -316,19 +437,26 @@ class UniverseFilter:
         if bars is not None and not bars.empty and "volume" in bars.columns:
             tail = bars.tail(20)
             if not tail.empty:
-                avg_dv = float((tail["close"] * tail["volume"]).mean())
+                avg_bar_dv = float((tail["close"] * tail["volume"]).mean())
+                daily_multiplier = 78.0 if self._settings.BAR_TIMEFRAME == "5Min" else 1.0
+                avg_dv = avg_bar_dv * daily_multiplier
                 if avg_dv < self._settings.MIN_AVG_DOLLAR_VOLUME:
                     self._emit_universe_skip(
                         SkipReason(
                             code=SkipCodes.ADV_BELOW_MIN,
                             message=(
-                                f"avg_dollar_volume={avg_dv:.0f} "
+                                f"avg_daily_dollar_volume={avg_dv:.0f} "
                                 f"below MIN_AVG_DOLLAR_VOLUME={self._settings.MIN_AVG_DOLLAR_VOLUME:.0f}"
                             ),
                             symbol=symbol,
                             price=ref_price,
                             quote_age_seconds=age,
-                            metadata={"avg_dollar_volume": avg_dv},
+                            metadata={
+                                "avg_dollar_volume": avg_dv,
+                                "avg_bar_dollar_volume": avg_bar_dv,
+                                "daily_projection_multiplier": daily_multiplier,
+                                "bar_timeframe": self._settings.BAR_TIMEFRAME,
+                            },
                         ),
                         quote=quote,
                     )

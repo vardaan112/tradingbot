@@ -166,7 +166,23 @@ class Settings(BaseSettings):
     SPREAD_FILTER_SPARSE_QUOTE_MULTIPLIER: float = Field(1.25, ge=1.0, le=10.0)
     SPREAD_FILTER_FRESH_QUOTE_MULTIPLIER: float = Field(1.15, ge=1.0, le=10.0)
     SPREAD_FILTER_FRESH_AGE_FRACTION: float = Field(0.5, gt=0.0, le=1.0)
-    QUOTE_STALENESS_SECONDS: float = Field(5.0, gt=0.0, le=300.0)
+    # Aliases / additional caps for IEX degraded-mode spread elasticity.
+    ELASTIC_SPREAD_ENABLED: Optional[bool] = None
+    ELASTIC_SPREAD_HARD_MAX_PCT: Optional[float] = Field(default=None, gt=0.0, le=0.25)
+    ELASTIC_SPREAD_TARGET_PROFIT_PCT: float = Field(0.0150, gt=0.0, le=1.0)
+    ELASTIC_SPREAD_MAX_COST_FRACTION: float = Field(0.35, gt=0.0, le=1.0)
+    ELASTIC_SPREAD_ATR_MULTIPLIER: float = Field(0.20, gt=0.0, le=10.0)
+    ELASTIC_SPREAD_BAR_CONFIRM_ENABLED: bool = True
+    ELASTIC_SPREAD_REQUIRE_BAR_HEALTH: bool = True
+    MIN_SPREAD_THRESHOLD_PERCENT: float = Field(0.0008, ge=0.0, le=0.05)
+    QUOTE_STALENESS_SECONDS: float = Field(10.0, gt=0.0, le=300.0)
+    QUOTE_FALLBACK_ENABLED: bool = True
+    QUOTE_MAX_AGE_SECONDS: Optional[float] = Field(default=None, gt=0.0, le=300.0)
+    QUOTE_STRICT_MAX_AGE_SECONDS: float = Field(3.0, gt=0.0, le=300.0)
+    QUOTE_STALE_SPREAD_MULTIPLIER: float = Field(1.5, ge=1.0, le=10.0)
+    QUOTE_FALLBACK_BAR_TIMEFRAME: Literal["1Min", "5Min", "15Min"] = "1Min"
+    QUOTE_FALLBACK_MAX_BAR_AGE_SECONDS: float = Field(90.0, gt=0.0, le=900.0)
+    QUOTE_FALLBACK_USE_BAR_MIDPOINT: bool = True
     MAX_STRATEGY_BAR_AGE_SECONDS: float = Field(900.0, ge=30.0, le=86_400.0)
     ORDER_TIMEOUT_SECONDS: float = Field(30.0, gt=0.0, le=3600.0)
     EMERGENCY_AGGRESSIVENESS_PCT: float = Field(0.0015, gt=0.0, le=0.05)
@@ -180,6 +196,18 @@ class Settings(BaseSettings):
     # ---- Global QQQ / macro regime (hourly bars) --------------------------------
     QQQ_REGIME_ENABLED: bool = True
     REGIME_QQQ_SYMBOL: str = "QQQ"
+    REGIME_ADAPTIVE_RSI_ENABLED: bool = True
+    REGIME_ANCHOR_SYMBOL: str = "SPY"
+    REGIME_ANCHOR_TIMEFRAME: Literal["1Hour", "1Day"] = "1Hour"
+    REGIME_RSI_PERIOD: int = Field(14, ge=2, le=200)
+    REGIME_SMA_PERIOD: int = Field(50, ge=5, le=500)
+    RSI_OVERSOLD_DEFAULT: float = Field(30.0, ge=1.0, le=50.0)
+    RSI_OVERSOLD_BULL: float = Field(40.0, ge=1.0, le=50.0)
+    RSI_OVERSOLD_BEAR: float = Field(25.0, ge=1.0, le=50.0)
+    RSI_OVERSOLD_NEUTRAL: float = Field(30.0, ge=1.0, le=50.0)
+    REGIME_BULL_RSI_MIN: float = Field(60.0, ge=1.0, le=100.0)
+    REGIME_PARABOLIC_RSI_MIN: float = Field(70.0, ge=1.0, le=100.0)
+    REGIME_BEAR_RSI_MAX: float = Field(45.0, ge=1.0, le=100.0)
     REGIME_ATR_RATIO_THRESHOLD: float = Field(1.2, gt=0.0, le=10.0)
     REGIME_USE_SMA50: bool = True
     REGIME_MAX_EQUITY_REDUCTION: float = Field(0.5, ge=0.0, le=1.0)
@@ -306,6 +334,11 @@ class Settings(BaseSettings):
 
     # Entry-skip diagnostics: cooldown for Discord + optional log throttling for repetitive reasons.
     SKIP_DIAGNOSTICS_DISCORD_COOLDOWN_SECONDS: float = Field(45.0, ge=0.0, le=86400.0)
+    DISCORD_SKIP_ALERTS_ENABLED: bool = True
+    DISCORD_SKIP_ALERT_COOLDOWN_SECONDS: Optional[float] = Field(
+        default=None, ge=0.0, le=86400.0
+    )
+    LOG_ALL_PRETRADE_SKIPS: bool = False
     SKIP_DIAGNOSTICS_NOISY_LOG_THROTTLE_SECONDS: float = Field(
         120.0, ge=0.0, le=86400.0
     )
@@ -409,9 +442,15 @@ class Settings(BaseSettings):
             raise ValueError(f"CANARY_PERSIST_FILENAME must be a bare filename: {name!r}")
         return name
 
-    @field_validator("SPREAD_FILTER_PCT_IEX", mode="before")
+    @field_validator(
+        "SPREAD_FILTER_PCT_IEX",
+        "ELASTIC_SPREAD_HARD_MAX_PCT",
+        "QUOTE_MAX_AGE_SECONDS",
+        "DISCORD_SKIP_ALERT_COOLDOWN_SECONDS",
+        mode="before",
+    )
     @classmethod
-    def _coerce_empty_spread_iex(cls, value: object) -> object:
+    def _coerce_empty_optional_float(cls, value: object) -> object:
         if value in {"", None}:
             return None
         return value
@@ -502,6 +541,19 @@ class Settings(BaseSettings):
     def _validate_consistency(self) -> "Settings":
         if self.MAX_DOLLARS_PER_TRADE > 0:
             self.MAX_EQUITY_USAGE_USD = float(self.MAX_DOLLARS_PER_TRADE)
+        if self.ELASTIC_SPREAD_ENABLED is not None:
+            self.SPREAD_FILTER_ELASTIC_ENABLED = bool(self.ELASTIC_SPREAD_ENABLED)
+        if self.ELASTIC_SPREAD_HARD_MAX_PCT is not None:
+            self.SPREAD_FILTER_MAX_PCT = float(self.ELASTIC_SPREAD_HARD_MAX_PCT)
+        if self.QUOTE_MAX_AGE_SECONDS is not None:
+            self.QUOTE_STALENESS_SECONDS = float(self.QUOTE_MAX_AGE_SECONDS)
+        if self.DISCORD_SKIP_ALERT_COOLDOWN_SECONDS is not None:
+            self.SKIP_DIAGNOSTICS_DISCORD_COOLDOWN_SECONDS = float(
+                self.DISCORD_SKIP_ALERT_COOLDOWN_SECONDS
+            )
+        if self.LOG_ALL_PRETRADE_SKIPS:
+            self.SKIP_DIAGNOSTICS_NOISY_LOG_THROTTLE_SECONDS = 0.0
+            self.SKIP_DIAGNOSTICS_UNIVERSE_LOG_THROTTLE_SECONDS = 0.0
         if self.ALLOW_FRACTIONAL is not None:
             self.ENABLE_FRACTIONAL = bool(self.ALLOW_FRACTIONAL)
         if self.FRACTIONAL_TRADING_ENABLED is not None:
@@ -540,6 +592,10 @@ class Settings(BaseSettings):
             raise ValueError("DYNAMIC_RSI_SHORT_ATR must be <= DYNAMIC_RSI_LONG_ATR.")
         if self.ADX_LOW >= self.ADX_HIGH:
             raise ValueError("ADX_LOW must be strictly less than ADX_HIGH.")
+        if self.REGIME_BEAR_RSI_MAX >= self.REGIME_BULL_RSI_MIN:
+            raise ValueError("REGIME_BEAR_RSI_MAX must be below REGIME_BULL_RSI_MIN.")
+        if self.REGIME_BULL_RSI_MIN > self.REGIME_PARABOLIC_RSI_MIN:
+            raise ValueError("REGIME_BULL_RSI_MIN must be <= REGIME_PARABOLIC_RSI_MIN.")
         if self.SCALE_IN_UNDERWATER_PCT >= 0:
             raise ValueError("SCALE_IN_UNDERWATER_PCT must be negative.")
         if not (1.0 <= self.SCALE_IN_RSI_THRESHOLD <= 50.0):

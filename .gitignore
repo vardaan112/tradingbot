@@ -1,7 +1,6 @@
 # Secrets and environment
 .env
 .env.*
-!.env.example
 
 # Runtime state and logs (keep the directories, ignore their contents)
 logs/*
