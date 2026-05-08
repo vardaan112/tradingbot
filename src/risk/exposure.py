@@ -38,6 +38,7 @@ class ExposureChecker:
         *,
         account: AccountSnapshot,
         positions: list[PositionSnapshot],
+        symbol: str | None = None,
         proposed_notional: float,
         bot_managed_notional: float,
     ) -> ExposureDecision:
@@ -57,8 +58,15 @@ class ExposureChecker:
         proposed_gross = current_gross + max(0.0, proposed_notional)
         proposed_gross_pct = proposed_gross / account.equity
 
-        # Position count check
-        if len(positions) >= self._settings.MAX_OPEN_POSITIONS:
+        sym_u = str(symbol or "").upper()
+        adding_to_existing = any(
+            p.symbol.upper() == sym_u and abs(float(p.qty)) > 1e-9
+            for p in positions
+        ) if sym_u else False
+
+        # Position count check: adding to an existing symbol does not increase
+        # the open-position count.
+        if len(positions) >= self._settings.MAX_OPEN_POSITIONS and not adding_to_existing:
             return ExposureDecision(
                 allowed=False,
                 reason="max_open_positions_reached",

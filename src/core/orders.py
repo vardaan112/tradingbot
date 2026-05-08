@@ -43,6 +43,13 @@ from .retries import retry_call
 from .state_store import OpenOrderEntry, StateStore
 
 
+def _fmt_qty(qty: float | int) -> str:
+    q = float(qty)
+    if abs(q - round(q)) < 1e-9:
+        return str(int(round(q)))
+    return f"{q:.6f}".rstrip("0").rstrip(".")
+
+
 @dataclass
 class WorkingOrder:
     """Bot-side representation of a live or recently submitted order."""
@@ -150,7 +157,7 @@ class OrderService:
             "dry_run": True,
             "symbol": symbol.upper(),
             "side": side.lower(),
-            "qty": int(qty),
+            "qty": float(qty),
             "limit_price": float(limit_price),
             "simulated_fill_price": sim_fill,
             "strategy": wo.strategy or self._strategy_name,
@@ -168,7 +175,7 @@ class OrderService:
             "simulated_fill_price=%.4f strategy=%s reason=%s discord_notified=%s timestamp=%s",
             symbol,
             side.lower(),
-            int(qty),
+            _fmt_qty(qty),
             limit_price,
             sim_fill,
             wo.strategy or self._strategy_name,
@@ -187,7 +194,7 @@ class OrderService:
     def submit_limit_entry(
         self,
         symbol: str,
-        qty: int,
+        qty: float,
         side: str,
         *,
         quote: Quote,
@@ -202,8 +209,10 @@ class OrderService:
         symbol = symbol.upper()
         side_l = side.lower()
 
-        if qty < 1:
-            self._log.warning("Refusing to submit qty<1 for %s", symbol)
+        qty = float(qty)
+        min_qty = float(self._settings.FRACTIONAL_MIN_QTY) if self._settings.ENABLE_FRACTIONAL else 1.0
+        if qty + 1e-12 < min_qty:
+            self._log.warning("Refusing to submit qty below min for %s qty=%s min_qty=%s", symbol, qty, min_qty)
             return None
 
         if self.has_open_for_symbol(symbol):
@@ -227,15 +236,6 @@ class OrderService:
             raise ValueError(f"unknown side {side!r}")
 
         coid = self._coid(symbol, side_l)
-        request = LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=order_side,
-            time_in_force=TimeInForce.DAY,
-            limit_price=limit_price,
-            client_order_id=coid,
-        )
-
         wo = WorkingOrder(
             client_order_id=coid,
             symbol=symbol,
@@ -252,10 +252,10 @@ class OrderService:
 
         if self._settings.DRY_RUN or not self._settings.LIVE_TRADING_ENABLED:
             self._log.info(
-                "event=dry_run_order_blocked symbol=%s side=%s qty=%d limit_price=%.4f coid=%s strategy=%s",
+                "event=dry_run_order_blocked symbol=%s side=%s qty=%s limit_price=%.4f coid=%s strategy=%s",
                 symbol,
                 side_l,
-                qty,
+                _fmt_qty(qty),
                 limit_price,
                 coid,
                 self._strategy_name,
@@ -271,13 +271,22 @@ class OrderService:
                 intent_reason=intent_reason,
             )
             self._log.info(
-                "[DRY_RUN] would submit %s %s qty=%d limit=%.4f coid=%s",
-                side_l, symbol, qty, limit_price, coid,
+                "[DRY_RUN] would submit %s %s qty=%s limit=%.4f coid=%s",
+                side_l, symbol, _fmt_qty(qty), limit_price, coid,
                 extra={"symbol": symbol, "client_order_id": coid, "strategy": self._strategy_name},
             )
             wo.status = "dry_run"
             self._persist_index()
             return wo
+
+        request = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=order_side,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_price,
+            client_order_id=coid,
+        )
 
         try:
             placed = self._client.submit_order(request)
@@ -289,8 +298,8 @@ class OrderService:
         wo.status = str(getattr(placed, "status", "new"))
         wo.last_event_at = datetime.now(timezone.utc)
         self._log.info(
-            "Submitted LIMIT %s %s qty=%d limit=%.4f coid=%s broker_id=%s",
-            side_l, symbol, qty, limit_price, coid, wo.broker_order_id,
+            "Submitted LIMIT %s %s qty=%s limit=%.4f coid=%s broker_id=%s",
+            side_l, symbol, _fmt_qty(qty), limit_price, coid, wo.broker_order_id,
             extra={"symbol": symbol, "client_order_id": coid, "strategy": self._strategy_name},
         )
         self._persist_index()
@@ -395,13 +404,15 @@ class OrderService:
     async def submit_buy_passive_joiner_async(
         self,
         symbol: str,
-        qty: int,
+        qty: float,
         *,
         quote_refresher: Callable[[], Optional[Quote]],
     ) -> Optional[WorkingOrder]:
         """Chase best bid with cancel-replace; limit BUY only."""
         symbol = symbol.upper()
-        if qty < 1:
+        qty = float(qty)
+        min_qty = float(self._settings.FRACTIONAL_MIN_QTY) if self._settings.ENABLE_FRACTIONAL else 1.0
+        if qty + 1e-12 < min_qty:
             return None
         if not self._settings.PASSIVE_JOINER_ENABLED:
             q0 = quote_refresher()
@@ -512,7 +523,7 @@ class OrderService:
                 self._log.info(
                     "event=dry_run_order_blocked symbol=%s side=buy qty=%s limit_price=%.4f coid=%s strategy=%s",
                     symbol,
-                    qty,
+                    _fmt_qty(qty),
                     limit_price,
                     coid,
                     self._strategy_name,
@@ -650,6 +661,214 @@ class OrderService:
         )
         return None
 
+    async def submit_midpoint_peg_async(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        quote_refresher: Callable[[], Optional[Quote]],
+        *,
+        intent_reason: str = "midpoint_peg",
+    ) -> Optional[WorkingOrder]:
+        """Limit at (bid+ask)/2; cancel after timeout and re-submit at new mid."""
+
+        symbol = symbol.upper()
+        side_l = side.lower()
+        if side_l not in {"buy", "sell"}:
+            raise ValueError(f"unsupported side {side!r}")
+        qty = float(qty)
+        min_qty = float(self._settings.FRACTIONAL_MIN_QTY) if self._settings.ENABLE_FRACTIONAL else 1.0
+        if qty + 1e-12 < min_qty:
+            return None
+
+        max_cycles = int(self._settings.MIDPOINT_PEG_MAX_CYCLES)
+        timeout_s = float(self._settings.MIDPOINT_PEG_TIMEOUT_SECONDS)
+        stale_lim = float(self._settings.QUOTE_STALENESS_SECONDS)
+        tag = str(self._settings.MIDPOINT_PEG_TAG or "midpoint_peg")
+
+        for cycle in range(1, max_cycles + 1):
+            quote = quote_refresher()
+            if quote is None:
+                self._log.info(
+                    "skip_code=midpoint_unfilled symbol=%s side=%s cycle=%d reason=no_quote",
+                    symbol,
+                    side_l,
+                    cycle,
+                )
+                return None
+            if not quote.is_fresh(stale_lim):
+                self._log.info(
+                    "skip_code=midpoint_unfilled symbol=%s side=%s cycle=%d reason=stale_quote",
+                    symbol,
+                    side_l,
+                    cycle,
+                )
+                return None
+            if quote.bid <= 0 or quote.ask <= quote.bid:
+                self._log.info(
+                    "skip_code=midpoint_unfilled symbol=%s side=%s cycle=%d reason=invalid_quote",
+                    symbol,
+                    side_l,
+                    cycle,
+                )
+                return None
+
+            mid = (quote.bid + quote.ask) / 2.0
+            limit_price = round_to_tick(mid, mode="nearest")
+            order_side = OrderSide.BUY if side_l == "buy" else OrderSide.SELL
+
+            coid = generate_client_order_id(
+                self._strategy_name,
+                symbol,
+                side_l,
+                short_id=f"mp{cycle}{short_uuid(6)}",
+            )
+            if self.has_open_for_symbol(symbol):
+                self._log.warning("Midpoint peg blocked: existing open for %s", symbol)
+                return None
+
+            wo = WorkingOrder(
+                client_order_id=coid,
+                symbol=symbol,
+                side=side_l,
+                qty=float(qty),
+                submitted_qty=float(qty),
+                limit_price=limit_price,
+                status="pending_new",
+                strategy=tag,
+            )
+            with self._lock:
+                self._working[coid] = wo
+                self._by_symbol[symbol] = coid
+
+            ts = datetime.now(timezone.utc).isoformat()
+            self._log.info(
+                "event=order_submit type=limit_midpoint symbol=%s side=%s qty=%s price=%.6f "
+                "bid=%.6f ask=%.6f client_order_id=%s strategy=%s intent=%s cycle=%d ts=%s",
+                symbol,
+                side_l,
+                _fmt_qty(qty),
+                limit_price,
+                quote.bid,
+                quote.ask,
+                coid,
+                tag,
+                intent_reason,
+                cycle,
+                ts,
+                extra={"symbol": symbol, "client_order_id": coid},
+            )
+
+            if self._settings.DRY_RUN or not self._settings.LIVE_TRADING_ENABLED:
+                self._notify_simulated_fill(
+                    wo=wo,
+                    symbol=symbol,
+                    side=side_l,
+                    qty=qty,
+                    limit_price=limit_price,
+                    quote=quote,
+                    intent_reason=f"{intent_reason}_cycle_{cycle}",
+                )
+                wo.status = "dry_run"
+                self._persist_index()
+                return wo
+
+            request = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=order_side,
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price,
+                client_order_id=coid,
+            )
+            try:
+                placed = await asyncio.to_thread(self._client.submit_order, request)
+            except Exception as exc:  # noqa: BLE001
+                self._log.info(
+                    "skip_code=midpoint_unfilled symbol=%s side=%s cycle=%d reason=submit_exc err=%s",
+                    symbol,
+                    side_l,
+                    cycle,
+                    exc,
+                )
+                self._release_symbol_lock(wo)
+                continue
+
+            broker_id = getattr(placed, "id", None) or getattr(placed, "order_id", None)
+            wo.broker_order_id = str(broker_id) if broker_id is not None else None
+            wo.status = str(getattr(placed, "status", "new"))
+            wo.last_event_at = datetime.now(timezone.utc)
+            self._persist_index()
+
+            deadline = time.monotonic() + timeout_s
+            filled = False
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.35)
+                try:
+                    ord_obj = await asyncio.to_thread(
+                        self._client.get_order_by_client_id,
+                        coid,
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                fq = float(getattr(ord_obj, "filled_qty", 0) or 0)
+                st = str(getattr(ord_obj, "status", "")).lower()
+                if fq >= float(qty) - 1e-6 or st == "filled":
+                    wo.filled_qty = fq
+                    wo.status = st or "filled"
+                    filled = True
+                    return wo
+                if st in {"canceled", "expired", "rejected"}:
+                    break
+
+            if filled:
+                return wo
+
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(self.cancel, coid)
+            self._log.info(
+                "event=order_cancel strategy=midpoint symbol=%s side=%s client_order_id=%s "
+                "reason=timeout cycle=%d",
+                symbol,
+                side_l,
+                coid,
+                cycle,
+                extra={"symbol": symbol, "client_order_id": coid},
+            )
+
+            with contextlib.suppress(Exception):
+                ord_obj = await asyncio.to_thread(self._client.get_order_by_client_id, coid)
+                fq = float(getattr(ord_obj, "filled_qty", 0) or 0)
+                st = str(getattr(ord_obj, "status", "")).lower()
+                if fq >= float(qty) - 1e-6 or st == "filled":
+                    wo.filled_qty = fq
+                    wo.status = st or "filled"
+                    return wo
+
+            q2 = quote_refresher()
+            new_mid = (
+                ((q2.bid + q2.ask) / 2.0) if q2 is not None and q2.bid > 0 and q2.ask > q2.bid else limit_price
+            )
+            self._log.info(
+                "event=order_resubmit strategy=midpoint symbol=%s side=%s new_price=%.6f "
+                "prev_price=%.6f next_cycle=%d",
+                symbol,
+                side_l,
+                round_to_tick(new_mid, mode="nearest"),
+                limit_price,
+                cycle + 1,
+                extra={"symbol": symbol},
+            )
+            self._release_symbol_lock(wo)
+
+        self._log.info(
+            "skip_code=midpoint_unfilled symbol=%s side=%s cycles=%d reason=max_cycles_exhausted",
+            symbol,
+            side_l,
+            max_cycles,
+        )
+        return None
+
     def _reconcile_after_placement_failure(
         self, wo: WorkingOrder, exc: BaseException
     ) -> Optional[WorkingOrder]:
@@ -702,7 +921,7 @@ class OrderService:
     def submit_limit_exit(
         self,
         symbol: str,
-        qty: int,
+        qty: float,
         side: str,
         *,
         quote: Quote,
@@ -716,7 +935,7 @@ class OrderService:
     def submit_emergency_flatten(
         self,
         symbol: str,
-        qty: int,
+        qty: float,
         side: str,
         *,
         quote: Quote,
@@ -725,7 +944,9 @@ class OrderService:
         """Marketable limit IOC for emergency flatten / stop breach."""
         symbol = symbol.upper()
         side_l = side.lower()
-        if qty < 1:
+        qty = float(qty)
+        min_qty = float(self._settings.FRACTIONAL_MIN_QTY) if self._settings.ENABLE_FRACTIONAL else 1.0
+        if qty + 1e-12 < min_qty:
             self._log.warning("Emergency flatten qty<1 for %s; skipping.", symbol)
             return None
 
@@ -744,15 +965,6 @@ class OrderService:
             raise ValueError(f"unknown side {side!r}")
 
         coid = self._coid(symbol + "EMG", side_l)
-        request = LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=order_side,
-            time_in_force=TimeInForce.IOC,
-            limit_price=limit_price,
-            client_order_id=coid,
-        )
-
         wo = WorkingOrder(
             client_order_id=coid,
             symbol=symbol,
@@ -767,17 +979,17 @@ class OrderService:
             self._working[coid] = wo
 
         self._log.critical(
-            "EMERGENCY FLATTEN %s %s qty=%d limit=%.4f coid=%s",
-            side_l, symbol, qty, limit_price, coid,
+            "EMERGENCY FLATTEN %s %s qty=%s limit=%.4f coid=%s",
+            side_l, symbol, _fmt_qty(qty), limit_price, coid,
             extra={"symbol": symbol, "client_order_id": coid, "strategy": wo.strategy},
         )
 
         if self._settings.DRY_RUN or not self._settings.LIVE_TRADING_ENABLED:
             self._log.info(
-                "event=dry_run_order_blocked symbol=%s side=%s qty=%d limit_price=%.4f coid=%s strategy=%s_emg",
+                "event=dry_run_order_blocked symbol=%s side=%s qty=%s limit_price=%.4f coid=%s strategy=%s_emg",
                 symbol,
                 side_l,
-                qty,
+                _fmt_qty(qty),
                 limit_price,
                 coid,
                 wo.strategy,
@@ -794,6 +1006,15 @@ class OrderService:
             )
             wo.status = "dry_run"
             return wo
+
+        request = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=order_side,
+            time_in_force=TimeInForce.IOC,
+            limit_price=limit_price,
+            client_order_id=coid,
+        )
 
         try:
             placed = self._client.submit_order(request)

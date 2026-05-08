@@ -71,11 +71,23 @@ class SkipCodes:
     CORRELATION_BLOCK = "CORRELATION_BLOCK"
     STREAM_UNHEALTHY = "STREAM_UNHEALTHY"
     UNIVERSE_INELIGIBLE = "UNIVERSE_INELIGIBLE"
+    BOLLINGER_FILTER_FAIL = "BOLLINGER_FILTER_FAIL"
+    VWAP_FILTER_FAIL = "VWAP_FILTER_FAIL"
+    TIME_WINDOW_FAIL = "TIME_WINDOW_FAIL"
     PRICE_BELOW_MIN = "PRICE_BELOW_MIN"
     ADV_BELOW_MIN = "ADV_BELOW_MIN"
     SPREAD_COMPUTE_FAILED = "SPREAD_COMPUTE_FAILED"
     REGIME_FILTER = "REGIME_FILTER"
     UNKNOWN_SKIP = "UNKNOWN_SKIP"
+    # Execution / macro / liquidity (audit strings).
+    SKIP_MIDPOINT_TIMEOUT = "skip_midpoint_timeout"
+    SKIP_MARKET_REGIME = "skip_market_regime"
+    SKIP_LOW_LIQUIDITY = "skip_low_liquidity"
+    SKIP_STALE_QUOTE = "skip_stale_quote"
+    EXIT_TRAIL_STOP = "exit_trail_stop"
+    EXIT_TIME_STOP = "exit_time_stop"
+    SKIP_TIME_EXIT_CANCELLED = "skip_time_exit_cancelled"
+    SKIP_TRAIL_EXIT_FAILED = "skip_trail_exit_failed"
 
     # Legacy aliases (kept for compatibility with older references/tests).
     RSI_NOT_OVERSOLD = RSI_NOT_TRIGGERED
@@ -202,6 +214,7 @@ def format_skip_log_line(
         f"event={event}",
         f"decision={sr.decision}",
         f"code={sr.code}",
+        f"skip_code={sr.code}",
         f"symbol={sr.symbol}",
         f'msg="{sr.message}"',
         _fmt_opt("rsi", sr.rsi),

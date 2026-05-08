@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -32,9 +33,10 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from config.settings import Settings, get_settings
 from strategies.filters import adx as adx_series
 from strategies.filters import sma as sma_series
-from strategies.indicators import atr, rsi
+from strategies.indicators import atr, bollinger_bands, rolling_vwap_zscore_bands, rsi
 
 _LOG = logging.getLogger("tradingbot.backtest")
+_ET = ZoneInfo("America/New_York")
 
 
 @dataclass(frozen=True)
@@ -64,10 +66,16 @@ class StrategyParams:
     adx_range_max: float
     atr_stop_multiplier: float
     trail_atr_multiplier: float
+    variant: str = "baseline"
+    dynamic_rsi_enabled: bool = False
+    bollinger_enabled: bool = False
+    vwap_strategy_enabled: bool = False
+    bollinger_bw_min: float = 0.0
+    vwap_z_threshold: float = 2.0
 
     def label(self) -> str:
         return (
-            f"rsi={self.rsi_oversold}_adxmax={self.adx_range_max}_"
+            f"variant={self.variant}_rsi={self.rsi_oversold}_adxmax={self.adx_range_max}_"
             f"atrstop={self.atr_stop_multiplier}_trailatr={self.trail_atr_multiplier}"
         )
 
@@ -109,6 +117,7 @@ class BacktestResult:
     equity_curve: pd.Series = field(default_factory=pd.Series)
     total_return: float = 0.0
     sharpe_ratio: float = 0.0
+    sortino_ratio: float = 0.0
     max_drawdown: float = 0.0
     win_rate: float = 0.0
     profit_factor: float = 0.0
@@ -138,6 +147,7 @@ class GridRow:
     best_trade_usd: float
     avg_r_multiple: float
     score: float
+    sortino_ratio: float = 0.0
 
 
 def parse_timeframe(spec: str) -> TimeFrame:
@@ -349,6 +359,13 @@ def build_strategy_settings(
             "ADX_RANGE_MAX": float(sp.adx_range_max),
             "ATR_STOP_MULTIPLIER": float(sp.atr_stop_multiplier),
             "TRAIL_ATR_MULTIPLIER": float(sp.trail_atr_multiplier),
+            "DEFAULT_RSI_ENTRY": float(sp.rsi_oversold),
+            "DYNAMIC_RSI_ENABLED": bool(sp.dynamic_rsi_enabled),
+            "BOLLINGER_ENABLED": bool(sp.bollinger_enabled),
+            "VWAP_STRATEGY_ENABLED": bool(sp.vwap_strategy_enabled),
+            "BOLLINGER_MIN_WIDTH_PCT": float(sp.bollinger_bw_min),
+            "BOLLINGER_BW_MIN": float(sp.bollinger_bw_min),
+            "VWAP_Z_THRESHOLD": float(sp.vwap_z_threshold),
             "BAR_TIMEFRAME": timeframe,  # type: ignore[arg-type]
             "MAX_RISK_PER_TRADE_PCT": float(risk_pct),
             "BOT_CAPITAL_BASE_USD": float(initial_equity),
@@ -386,11 +403,80 @@ def simulate_symbol(
     atr_v = atr(h, l, c, length=int(settings.ATR_LENGTH))
     adx_v = adx_series(h, l, c, length=int(settings.ADX_LENGTH))
     sma_v = sma_series(c, int(settings.SMA_FILTER_LENGTH))
+    if bool(settings.DYNAMIC_RSI_ENABLED):
+        atr_short = atr(h, l, c, length=int(settings.DYNAMIC_RSI_SHORT_ATR))
+        atr_long = atr(h, l, c, length=int(settings.DYNAMIC_RSI_LONG_ATR))
+        atr_ratio = atr_short / atr_long.replace(0.0, np.nan)
+        entry_threshold = (
+            float(settings.DYNAMIC_RSI_BASE) * atr_ratio.fillna(1.0)
+        ).clip(float(settings.DYNAMIC_RSI_MIN), float(settings.DYNAMIC_RSI_MAX))
+    else:
+        atr_pct = atr_v / c.replace(0.0, np.nan)
+        entry_threshold = pd.Series(
+            np.where(
+                atr_pct > float(settings.HIGH_VOL_ATR_PCT_THRESHOLD),
+                float(settings.HIGH_VOL_RSI_ENTRY),
+                float(settings.DEFAULT_RSI_ENTRY),
+            ),
+            index=bars.index,
+            dtype=float,
+        )
+    band_ok = pd.Series(True, index=bars.index)
+    band_meta: dict[str, pd.Series] = {}
+    vwap_z = pd.Series(np.nan, index=bars.index, dtype=float)
+    if bool(settings.BOLLINGER_ENABLED):
+        bb_basis, bb_upper, bb_lower, bb_width = bollinger_bands(
+            c,
+            length=int(settings.BOLLINGER_LENGTH),
+            num_std=float(settings.BOLLINGER_STD),
+        )
+        touch_ok = pd.Series(True, index=bars.index)
+        if bool(settings.BOLLINGER_REQUIRE_TOUCH):
+            touch_ok = c <= bb_lower
+        band_ok = band_ok & touch_ok & (bb_width >= float(settings.BOLLINGER_MIN_WIDTH_PCT))
+        band_meta.update(
+            {
+                "bollinger_basis": bb_basis,
+                "bollinger_upper": bb_upper,
+                "bollinger_lower": bb_lower,
+                "bollinger_width_pct": bb_width,
+            },
+        )
+    if bool(settings.VWAP_STRATEGY_ENABLED):
+        vwap, vwap_upper, vwap_lower, vwap_z, vwap_dist, vwap_dev = rolling_vwap_zscore_bands(
+            h,
+            l,
+            c,
+            bars["volume"].astype(float),
+            length=int(settings.VWAP_LENGTH),
+            z_threshold=float(settings.VWAP_Z_THRESHOLD),
+        )
+        band_ok = band_ok & (vwap_z <= -float(settings.VWAP_Z_THRESHOLD))
+        band_meta.update(
+            {
+                "vwap": vwap,
+                "vwap_upper": vwap_upper,
+                "vwap_lower": vwap_lower,
+                "vwap_zscore": vwap_z,
+                "vwap_distance_pct": vwap_dist,
+                "vwap_deviation": vwap_dev,
+            },
+        )
     lb = int(settings.SMA_SLOPE_LOOKBACK_BARS)
     sma_slope = sma_v - sma_v.shift(lb)
     adx_max = float(settings.ADX_RANGE_MAX)
     adx_ok = adx_v < adx_max
     allow = (sma_slope > 0.0) | adx_ok
+    if bool(settings.VWAP_STRATEGY_ENABLED):
+        deep_vwap = vwap_z <= (-float(settings.VWAP_Z_THRESHOLD) * 1.5)
+        adx_high_ok = (adx_v < float(settings.ADX_HIGH)) | deep_vwap.fillna(False)
+        allow = allow & adx_high_ok
+    if bool(settings.BOLLINGER_ENABLED and settings.VWAP_STRATEGY_ENABLED):
+        # Hybrid entry mode uses VWAP/Bollinger/ADX-high gates as the active
+        # regime control and does not hard-block solely on the old SMA/ADX25 rule.
+        allow = band_ok.copy()
+        if bool(settings.VWAP_STRATEGY_ENABLED):
+            allow = allow & ((adx_v < float(settings.ADX_HIGH)) | (vwap_z <= (-float(settings.VWAP_Z_THRESHOLD) * 1.5)).fillna(False))
     allow = allow & sma_slope.notna() & adx_v.notna()
 
     hi_c = float(settings.HIGH_CONVICTION_RISK_MULTIPLIER)
@@ -419,14 +505,29 @@ def simulate_symbol(
     atr_e = atr_v.to_numpy(dtype=float)
     adx_e = adx_v.to_numpy(dtype=float)
     sma_e = sma_v.to_numpy(dtype=float)
+    thr_e = entry_threshold.to_numpy(dtype=float)
+    band_ok_a = band_ok.fillna(False).to_numpy(dtype=bool)
     allow_a = allow.to_numpy()
     conv_a = conv.to_numpy(dtype=float)
     idx = list(bars.index)
+    if bool(settings.TIME_OF_DAY_FILTER_ENABLED):
+        start_h, start_m = [int(x) for x in str(settings.TIME_OF_DAY_TRADE_START).split(":", 1)]
+        end_h, end_m = [int(x) for x in str(settings.TIME_OF_DAY_TRADE_END).split(":", 1)]
+        start_min = start_h * 60 + start_m
+        end_min = end_h * 60 + end_m
+        et_index = bars.index.tz_convert(_ET) if bars.index.tz is not None else bars.index.tz_localize(timezone.utc).tz_convert(_ET)
+        minute_of_day = pd.Series(et_index.hour * 60 + et_index.minute, index=bars.index)
+        if start_min <= end_min:
+            time_ok = (minute_of_day >= start_min) & (minute_of_day <= end_min)
+        else:
+            time_ok = (minute_of_day >= start_min) | (minute_of_day <= end_min)
+        time_ok_a = time_ok.to_numpy(dtype=bool)
+    else:
+        time_ok_a = np.ones(n, dtype=bool)
 
     trades: list[TradeResult] = []
     eq_pts: list[tuple[pd.Timestamp, float]] = []
     sym = symbol.upper()
-    oversold = float(settings.RSI_OVERSOLD)
     rsi_x = float(settings.RSI_EXIT)
 
     def mark(i: int) -> None:
@@ -442,10 +543,16 @@ def simulate_symbol(
             base = settings.resolved_capital_base(max(cash, 1.0))
             sd = max(atr0 * float(settings.ATR_STOP_MULTIPLIER), 1e-9)
             rb = base * float(settings.MAX_RISK_PER_TRADE_PCT) * cm
-            nsh = math.floor(min(rb / sd, float(settings.MAX_EQUITY_USAGE_USD) / max(px, 1e-9)))
+            raw_nsh = min(rb / sd, float(settings.MAX_EQUITY_USAGE_USD) / max(px, 1e-9))
+            if bool(settings.ENABLE_FRACTIONAL):
+                nsh = math.floor(raw_nsh * 1000.0) / 1000.0
+                min_qty = min(float(settings.MIN_SHARES), float(settings.FRACTIONAL_MIN_QTY))
+            else:
+                nsh = float(math.floor(raw_nsh))
+                min_qty = float(settings.MIN_SHARES)
             snap = pending
             pending = None
-            if nsh >= 1:
+            if nsh >= min_qty and nsh * px >= float(settings.MIN_ORDER_DOLLARS):
                 cost = nsh * px * (1.0 + fee)
                 if cost <= cash:
                     cash -= cost
@@ -553,7 +660,8 @@ def simulate_symbol(
 
         if sh < 1e-9 and pending is None:
             r_i = float(rsi_e[i]) if math.isfinite(rsi_e[i]) else 999.0
-            if bool(allow_a[i]) and r_i < oversold and i + 1 < n:
+            thr_i = float(thr_e[i]) if math.isfinite(thr_e[i]) else float(settings.DEFAULT_RSI_ENTRY)
+            if bool(time_ok_a[i]) and bool(allow_a[i]) and bool(band_ok_a[i]) and r_i < thr_i and i + 1 < n:
                 reg_tp = "Range" if (math.isfinite(adx_e[i]) and float(adx_e[i]) < adx_max) else "Trending"
                 pending = {
                     "ex": i + 1,
@@ -563,7 +671,13 @@ def simulate_symbol(
                     "adx": float(adx_e[i]) if math.isfinite(adx_e[i]) else 0.0,
                     "sma": float(sma_e[i]) if math.isfinite(sma_e[i]) else c_i,
                     "regime": reg_tp,
+                    "rsi_threshold": thr_i,
+                    "variant": sp.variant,
                 }
+                for key, series in band_meta.items():
+                    val = float(series.iloc[i])
+                    if math.isfinite(val):
+                        pending[key] = val
 
         mark(i)
 
@@ -586,6 +700,10 @@ def compute_performance_metrics(
     sharpe = 0.0
     if len(rets) > 2 and float(rets.std()) > 1e-12:
         sharpe = float(rets.mean() / rets.std() * math.sqrt(252.0))
+    sortino = 0.0
+    downside = rets[rets < 0.0]
+    if len(rets) > 2 and len(downside) > 1 and float(downside.std()) > 1e-12:
+        sortino = float(rets.mean() / downside.std() * math.sqrt(252.0))
 
     max_dd = 0.0
     if len(daily) > 1:
@@ -616,6 +734,7 @@ def compute_performance_metrics(
     return {
         "total_return": total_return,
         "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
         "max_drawdown": max_dd,
         "win_rate": win_rate,
         "profit_factor": pf,
@@ -639,6 +758,54 @@ def default_param_grid() -> Iterable[StrategyParams]:
             atr_stop_multiplier=c,
             trail_atr_multiplier=c,
         )
+
+
+def variant_comparison_grid(settings: Settings) -> list[StrategyParams]:
+    """Fixed 3-row grid for baseline vs Bollinger vs VWAP entry filters."""
+
+    base_rsi = float(settings.RSI_OVERSOLD)
+    adx_max = float(settings.ADX_RANGE_MAX)
+    atr_stop = float(settings.ATR_STOP_MULTIPLIER)
+    trail_atr = float(settings.TRAIL_ATR_MULTIPLIER)
+    return [
+        StrategyParams(
+            base_rsi,
+            adx_max,
+            atr_stop,
+            trail_atr,
+            variant="baseline",
+        ),
+        StrategyParams(
+            base_rsi,
+            adx_max,
+            atr_stop,
+            trail_atr,
+            variant="bollinger_extreme_stretch",
+            bollinger_enabled=True,
+            bollinger_bw_min=float(settings.BOLLINGER_MIN_WIDTH_PCT),
+        ),
+        StrategyParams(
+            base_rsi,
+            adx_max,
+            atr_stop,
+            trail_atr,
+            variant="vwap_distance_mean_reversion",
+            vwap_strategy_enabled=True,
+            vwap_z_threshold=float(settings.VWAP_Z_THRESHOLD),
+        ),
+        StrategyParams(
+            base_rsi,
+            adx_max,
+            atr_stop,
+            trail_atr,
+            variant="hybrid_vwap_bollinger_dynamic",
+            dynamic_rsi_enabled=True,
+            bollinger_enabled=True,
+            vwap_strategy_enabled=True,
+            bollinger_bw_min=float(settings.BOLLINGER_MIN_WIDTH_PCT),
+            vwap_z_threshold=float(settings.VWAP_Z_THRESHOLD),
+        ),
+    ]
 
 
 def grid_score(sharpe: float, max_dd: float) -> float:
@@ -708,6 +875,7 @@ def run_grid(
 
         avg_ret = float(np.mean([r.total_return for r in per]))
         avg_sh = float(np.mean([r.sharpe_ratio for r in per]))
+        avg_sortino = float(np.mean([r.sortino_ratio for r in per]))
         avg_dd = float(np.mean([r.max_drawdown for r in per]))
         all_t = [t for r in per for t in r.trades]
         n_tr = len(all_t)
@@ -748,6 +916,7 @@ def run_grid(
                 best_trade_usd=best,
                 avg_r_multiple=avg_r,
                 score=sc,
+                sortino_ratio=avg_sortino,
             )
         )
         _LOG.info(
@@ -768,6 +937,7 @@ def trade_row_dict(run_id: str, pid: str, sp: StrategyParams, t: TradeResult) ->
         "run_id": run_id,
         "parameter_set_id": pid,
         "parameter_label": sp.label(),
+        "variant": sp.variant,
         "symbol": t.symbol,
         "entry_time": t.entry_time,
         "exit_time": t.exit_time,
@@ -806,6 +976,7 @@ def write_results_csv(path: Path, rows: Sequence[GridRow]) -> None:
                 "symbol_scope": r.symbol,
                 "total_return": r.total_return,
                 "sharpe_ratio": r.sharpe_ratio,
+                "sortino_ratio": r.sortino_ratio,
                 "max_drawdown": r.max_drawdown,
                 "win_rate": r.win_rate,
                 "profit_factor": r.profit_factor,
@@ -816,6 +987,7 @@ def write_results_csv(path: Path, rows: Sequence[GridRow]) -> None:
                 "best_trade_usd": r.best_trade_usd,
                 "avg_r_multiple": r.avg_r_multiple,
                 "score": r.score,
+                "variant": r.params.variant,
                 "params_label": r.params.label(),
             },
         )
@@ -831,6 +1003,7 @@ def write_trades_csv(path: Path, rows: Sequence[dict[str, Any]]) -> None:
                 "source",
                 "run_id",
                 "parameter_set_id",
+                "variant",
                 "symbol",
                 "entry_time",
                 "exit_time",
@@ -874,25 +1047,33 @@ def write_summary_md(path: Path, rows: Sequence[GridRow]) -> None:
     lines += ["## Top 10 by Sharpe", ""]
     for r in top_sh:
         lines.append(
-            f"- `{r.params.label()}` Sharpe={r.sharpe_ratio:.3f} MDD={r.max_drawdown:.4f} PF={r.profit_factor:.2f}",
+            f"- `{r.params.label()}` Sharpe={r.sharpe_ratio:.3f} Sortino={r.sortino_ratio:.3f} "
+            f"MDD={r.max_drawdown:.4f} PF={r.profit_factor:.2f}",
         )
     lines.append("")
     top_dd = sorted(rows, key=lambda r: r.max_drawdown, reverse=True)[:10]
     lines += ["## Top 10 by lowest drawdown (closest to zero)", ""]
     for r in top_dd:
-        lines.append(f"- `{r.params.label()}` MDD={r.max_drawdown:.4f} Sharpe={r.sharpe_ratio:.3f}")
+        lines.append(
+            f"- `{r.params.label()}` MDD={r.max_drawdown:.4f} "
+            f"Sharpe={r.sharpe_ratio:.3f} Sortino={r.sortino_ratio:.3f}"
+        )
     lines.append("")
     top_pf = sorted(rows, key=lambda r: r.profit_factor, reverse=True)[:10]
     lines += ["## Top 10 by profit factor", ""]
     for r in top_pf:
-        lines.append(f"- `{r.params.label()}` PF={r.profit_factor:.2f} Sharpe={r.sharpe_ratio:.3f}")
+        lines.append(
+            f"- `{r.params.label()}` PF={r.profit_factor:.2f} "
+            f"Sharpe={r.sharpe_ratio:.3f} Sortino={r.sortino_ratio:.3f}"
+        )
     lines.append("")
     bal = sorted(rows, key=lambda r: r.score, reverse=True)
     lines += ["## Best balanced (Sharpe − 2×|MDD|)", ""]
     if bal:
         b = bal[0]
         lines.append(
-            f"- `{b.params.label()}` score={b.score:.4f} Sharpe={b.sharpe_ratio:.3f} MDD={b.max_drawdown:.4f}",
+            f"- `{b.params.label()}` score={b.score:.4f} Sharpe={b.sharpe_ratio:.3f} "
+            f"Sortino={b.sortino_ratio:.3f} MDD={b.max_drawdown:.4f}",
         )
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -923,6 +1104,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p.add_argument("--use-cache", action="store_true", default=True)
     p.add_argument("--no-cache", action="store_true")
     p.add_argument("--refresh-cache", action="store_true")
+    p.add_argument(
+        "--compare-variants",
+        action="store_true",
+        help="Compare baseline, Bollinger extreme stretch, and VWAP-distance variants.",
+    )
     p.add_argument("--output-results", type=str, default="reports/backtest_results.csv")
     p.add_argument("--output-trades", type=str, default="reports/backtest_trades.csv")
     p.add_argument("--summary", type=str, default="reports/backtest_summary.md")
@@ -981,7 +1167,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
 
     run_id = str(uuid.uuid4())
-    grid = list(default_param_grid())
+    grid = variant_comparison_grid(settings) if bool(args.compare_variants) else list(default_param_grid())
     _LOG.info(
         "event=backtest_start run_id=%s symbols=%s grid=%d %s..%s",
         run_id,

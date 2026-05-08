@@ -180,6 +180,35 @@ def test_simulated_fill_sink_invoked_on_dry_run_limit_entry(
     assert "discord_notified=true" in sim_line
 
 
+def test_dry_run_limit_entry_preserves_fractional_quantity(
+    make_settings_factory,
+    tmp_path: Path,
+) -> None:
+    seen: list[dict] = []
+    settings = make_settings_factory(
+        DRY_RUN=True,
+        LIVE_TRADING_ENABLED=False,
+        ENABLE_FRACTIONAL=True,
+        FRACTIONAL_MIN_QTY=0.001,
+        STATE_DIR=str(tmp_path / "st_frac"),
+        LOG_DIR=str(tmp_path / "logs_frac"),
+        DATABASE_PATH=str(tmp_path / "frac.sqlite"),
+    )
+    svc = OrderService(
+        _StubBroker(),
+        settings,
+        StateStore(tmp_path / "ost_frac"),
+        QuoteCache(max_age_seconds=5.0, feed="iex"),
+        strategy_name="test",
+        simulated_fill_sink=seen.append,
+    )
+    wo = svc.submit_limit_entry("TSLA", 0.177, "buy", quote=_quote(), intent_reason="fractional_unit_test")
+
+    assert wo is not None
+    assert wo.qty == pytest.approx(0.177)
+    assert seen[0]["qty"] == pytest.approx(0.177)
+
+
 @pytest.mark.asyncio
 async def test_require_discord_on_startup_exits_before_canary(
     monkeypatch: pytest.MonkeyPatch,

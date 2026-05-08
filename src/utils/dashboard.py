@@ -905,7 +905,7 @@ def main() -> None:
             "`pip install streamlit-autorefresh`",
         )
 
-    refresh_clicked = sidebar.button("Refresh now", use_container_width=True)
+    refresh_clicked = sidebar.button("Refresh now", width="stretch")
     if refresh_clicked:
         load_account_snapshot.clear()
         load_open_positions_rows.clear()
@@ -1147,7 +1147,7 @@ def main() -> None:
     if wl_err:
         st.warning(f"Live Watchlist unavailable: {wl_err}")
     elif wl_rows:
-        st.dataframe(pd.DataFrame(wl_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(wl_rows), width="stretch", hide_index=True)
     else:
         st.info("No watchlist rows.")
 
@@ -1185,7 +1185,7 @@ def main() -> None:
                 xaxis_title="Time",
                 yaxis_title="Cumulative P/L",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         elif hist_df.empty:
             st.info("No trade history in SQLite for cumulative P/L.")
         else:
@@ -1217,7 +1217,7 @@ def main() -> None:
                         showlegend=True,
                         margin=dict(l=20, r=20, t=40, b=20),
                     )
-                    st.plotly_chart(fig2, use_container_width=True)
+                    st.plotly_chart(fig2, width="stretch")
                 else:
                     st.info("No positive market-value positions.")
             else:
@@ -1240,18 +1240,18 @@ def main() -> None:
             height=300,
             margin=dict(l=40, r=20, t=30, b=40),
         )
-        st.plotly_chart(figd, use_container_width=True)
+        st.plotly_chart(figd, width="stretch")
 
     st.subheader("Open positions")
     if pos_rows:
-        st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(pos_rows), width="stretch", hide_index=True)
     else:
         st.caption("No rows (or Alpaca unavailable).")
 
     st.subheader("Recent trades (SQLite, latest 25)")
     recent_df = db_pack.get("recent")
     if isinstance(recent_df, pd.DataFrame) and not recent_df.empty:
-        st.dataframe(recent_df, use_container_width=True, hide_index=True)
+        st.dataframe(recent_df, width="stretch", hide_index=True)
     else:
         st.caption("No completed trades loaded.")
 

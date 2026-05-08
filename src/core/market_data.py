@@ -9,6 +9,7 @@ warm-up period before evaluating signals.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -153,7 +154,11 @@ class BarFetcher:
         max_delay: float,
     ) -> None:
         self._client = client
-        self._feed_enum = DataFeed.SIP if feed == "sip" else DataFeed.IEX
+        feed_norm = str(feed or "").strip().lower()
+        data_feed_override = str(os.getenv("DATA_FEED", "")).strip().lower()
+        if data_feed_override == "iex":
+            feed_norm = "iex"
+        self._feed_enum = DataFeed.SIP if feed_norm == "sip" else DataFeed.IEX
         self._max_attempts = max_attempts
         self._base_delay = base_delay
         self._max_delay = max_delay

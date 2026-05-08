@@ -13,6 +13,7 @@ Capability detection probes whether the account is entitled to SIP data so
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -94,16 +95,25 @@ def build_alpaca_clients(settings: Settings) -> AlpacaClients:
     )
 
     # Determine effective feed: probe SIP only when caller selected `auto`.
+    # Fast-path override for operators that explicitly force IEX in `.env`
+    # via DATA_FEED=iex (legacy alias kept for convenience).
     log_app = logging.getLogger(LOGGER_APP)
     log_stream = logging.getLogger(LOGGER_STREAM)
     sip_supported = False
-    if settings.feed_preference == "auto":
-        probe = settings.symbols_list[0] if settings.symbols_list else "SPY"
-        sip_supported = detect_sip_supported(historical_data, probe, logger=log_app)
-    elif settings.feed_preference == FEED_SIP:
-        sip_supported = True
+    data_feed_override = str(os.getenv("DATA_FEED", "")).strip().lower()
+    if data_feed_override == FEED_IEX:
+        resolved_feed = FEED_IEX
+        log_app.info(
+            "event=data_feed_override source=DATA_FEED value=iex action=skip_sip_probe",
+        )
+    else:
+        if settings.feed_preference == "auto":
+            probe = settings.symbols_list[0] if settings.symbols_list else "SPY"
+            sip_supported = detect_sip_supported(historical_data, probe, logger=log_app)
+        elif settings.feed_preference == FEED_SIP:
+            sip_supported = True
 
-    resolved_feed = settings.feed_resolved(sip_supported)
+        resolved_feed = settings.feed_resolved(sip_supported)
 
     if resolved_feed == FEED_IEX:
         log_app.warning(

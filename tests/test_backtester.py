@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -398,3 +399,63 @@ def test_vector_simulate_runs(monkeypatch, make_settings_factory) -> None:
     )
     assert res.symbol == "SPY"
     assert isinstance(res.trades, list)
+
+
+def test_variant_comparison_grid_runs_offline(monkeypatch, make_settings_factory, tmp_path) -> None:
+    settings = make_settings_factory(
+        ADX_RANGE_MAX=100.0,
+        BAR_TIMEFRAME="5Min",
+        BOLLINGER_MIN_WIDTH_PCT=0.0,
+        MAX_EQUITY_USAGE_USD=10_000.0,
+    )
+    n = 420
+    idx = pd.date_range("2026-04-01", periods=n, freq="5min", tz=timezone.utc)
+    x = np.linspace(0, 18, n)
+    close = pd.Series(100.0 + 2.0 * np.sin(x), index=idx)
+    close.iloc[260] = 92.0
+    bars = pd.DataFrame(
+        {
+            "open": close.shift(1).bfill(),
+            "high": close + 0.8,
+            "low": close - 0.8,
+            "close": close,
+            "volume": [1e6] * n,
+        },
+        index=idx,
+    )
+    monkeypatch.setattr(bt, "load_or_fetch_bars", lambda **_k: bars)
+    cfg = bt.BacktestConfig(
+        symbols=("MARA",),
+        start=idx[0].to_pydatetime(),
+        end=idx[-1].to_pydatetime(),
+        timeframe="5Min",
+        initial_equity=50_000.0,
+        risk_pct=float(settings.MAX_RISK_PER_TRADE_PCT),
+        spread_pct=0.0005,
+        slippage_bps=1.0,
+        fee_bps_per_side=0.0,
+        data_feed="iex",
+        use_cache=False,
+        refresh_cache=False,
+        cache_dir=tmp_path / "cache",
+        reports_dir=tmp_path,
+        output_results=tmp_path / "r.csv",
+        output_trades=tmp_path / "t.csv",
+        output_summary=tmp_path / "s.md",
+    )
+
+    rows, _trades = bt.run_grid(
+        run_id="variant-unit-test",
+        base_settings=settings,
+        cfg=cfg,
+        client=MagicMock(),
+        param_grid=bt.variant_comparison_grid(settings),
+    )
+
+    assert {r.params.variant for r in rows} == {
+        "baseline",
+        "bollinger_extreme_stretch",
+        "vwap_distance_mean_reversion",
+        "hybrid_vwap_bollinger_dynamic",
+    }
+    assert all(hasattr(r, "sortino_ratio") for r in rows)

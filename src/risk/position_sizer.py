@@ -8,7 +8,8 @@ Sizing pipeline:
 4. stop_distance = ATR * ATR_STOP_MULTIPLIER
 5. raw_shares = floor(risk_budget / stop_distance)
 6. clamp by existing USD / BP / gross / bot-managed ceilings
-7. integer shares unless ENABLE_FRACTIONAL
+7. integer shares unless ENABLE_FRACTIONAL; fractional quantities are rounded down
+   to 0.001-share precision by default
 """
 
 from __future__ import annotations
@@ -88,6 +89,7 @@ class PositionSizer:
         anti_martingale_multiplier: float = 1.0,
         risk_mode: str = "normal",
         recent_trade_hint: str = "",
+        regime_equity_multiplier: float = 1.0,
     ) -> PositionSize:
         if sizing_block_reason:
             return self._skip(
@@ -125,7 +127,12 @@ class PositionSizer:
                 risk_mode=risk_mode,
             )
 
-        capital_base = self._settings.resolved_capital_base(account.equity)
+        rem = float(regime_equity_multiplier)
+        if rem <= 0 or not math.isfinite(rem):
+            rem = 1.0
+
+        capital_base = self._settings.resolved_capital_base(account.equity) * rem
+        equity_cap_usd = self._settings.max_dollars_per_trade * rem
         if capital_base <= 0:
             return self._skip(
                 symbol,
@@ -181,7 +188,7 @@ class PositionSizer:
 
         raw_shares = risk_budget / stop_distance
 
-        usd_cap_shares = self._settings.MAX_EQUITY_USAGE_USD / entry_price
+        usd_cap_shares = equity_cap_usd / entry_price
         bp = self._compliance.buying_power(account)
         bp_shares = bp / entry_price if bp > 0 else 0.0
 
@@ -192,7 +199,7 @@ class PositionSizer:
         )
         gross_cap_shares = gross_cap_dollars / entry_price if entry_price > 0 else 0.0
 
-        remaining_bot = max(0.0, self._settings.MAX_EQUITY_USAGE_USD - bot_managed_notional)
+        remaining_bot = max(0.0, equity_cap_usd - bot_managed_notional)
         remaining_bot_shares = remaining_bot / entry_price if entry_price > 0 else 0.0
 
         candidates = [
@@ -207,14 +214,14 @@ class PositionSizer:
         fractional_enabled = bool(self._settings.ENABLE_FRACTIONAL)
         min_shares = float(self._settings.MIN_SHARES)
         if fractional_enabled:
-            min_shares = min(min_shares, 0.001)
+            min_shares = min(min_shares, float(self._settings.FRACTIONAL_MIN_QTY))
         if not fractional_enabled:
             shares: float = float(math.floor(clamped))
         else:
             shares = max(0.0, math.floor(clamped * 1000.0) / 1000.0)
 
         if shares < min_shares:
-            max_alloc = float(self._settings.max_dollars_per_trade)
+            max_alloc = float(equity_cap_usd)
             floored_shares = float(math.floor(clamped))
             if (not fractional_enabled) and (max_alloc / entry_price) < min_shares:
                 explicit_reason = (
@@ -225,7 +232,7 @@ class PositionSizer:
                     f"SIZE_ZERO: clamped shares below MIN_SHARES={min_shares:.4f}"
                 )
             self._log.warning(
-                "event=size_zero symbol=%s code=SIZE_ZERO price=%.6f max_allocation_usd=%.6f "
+                "event=position_sizing_warning symbol=%s code=SIZE_ZERO price=%.6f max_allocation_usd=%.6f "
                 "raw_shares=%.8f clamped_shares=%.8f floored_shares=%.8f final_shares=%.8f "
                 "fractional_enabled=%s min_shares=%.4f clamping_reason=%s",
                 symbol,
@@ -284,9 +291,74 @@ class PositionSizer:
             )
 
         proposed_notional = shares * entry_price
+        min_order_dollars = float(self._settings.MIN_ORDER_DOLLARS)
+        if min_order_dollars > 0.0 and proposed_notional < min_order_dollars:
+            self._log.warning(
+                "event=position_sizing_warning symbol=%s code=SIZE_ZERO price=%.6f "
+                "max_allocation_usd=%.6f raw_shares=%.8f clamped_shares=%.8f "
+                "final_shares=%.8f final_notional=%.6f min_order_dollars=%.6f "
+                "fractional_enabled=%s clamping_reason=%s reason=min_order_dollars",
+                symbol,
+                entry_price,
+                float(equity_cap_usd),
+                raw_shares,
+                clamped,
+                shares,
+                proposed_notional,
+                min_order_dollars,
+                str(fractional_enabled).lower(),
+                clamping_reason,
+                extra={"symbol": symbol},
+            )
+            self._log_sizing(
+                symbol=symbol,
+                capital_base=capital_base,
+                risk_budget=risk_budget,
+                atr=atr,
+                stop_distance=stop_distance,
+                raw_shares=raw_shares,
+                clamping_reason=f"min_order_dollars:{min_order_dollars:.2f}",
+                final_shares=0.0,
+                outcome="skip",
+                conviction_risk_multiplier=conviction_risk_multiplier,
+                effective_risk_pct=eff_risk_pct,
+                risk_mode=risk_mode,
+                anti_martingale_multiplier=am_mult,
+                recent_trade_hint=recent_trade_hint,
+                sizing_mode=sizing_mode,
+                risk_pct_before_kelly_caps=risk_pct_pre_kelly,
+                risk_pct_after_kelly=float(eff_risk_pct),
+                kelly_win_rate=k_stats.get("win_rate"),
+                kelly_avg_win=k_stats.get("avg_win"),
+                kelly_avg_loss=k_stats.get("avg_loss"),
+                kelly_profit_factor=k_stats.get("profit_factor"),
+                kelly_fraction=fk,
+                kelly_modified=mod_k,
+            )
+            return self._skip(
+                symbol,
+                (
+                    "SIZE_ZERO: final notional below MIN_ORDER_DOLLARS"
+                    f"|price={entry_price:.6f}|raw_shares={raw_shares:.8f}"
+                    f"|final_shares={shares:.8f}|final_notional={proposed_notional:.6f}"
+                    f"|min_order_dollars={min_order_dollars:.6f}"
+                    f"|fractional_enabled={str(fractional_enabled).lower()}"
+                    f"|clamped_by={clamping_reason}"
+                ),
+                entry_price=entry_price,
+                stop_distance=stop_distance,
+                risk_budget=risk_budget,
+                capital_base=capital_base,
+                conviction_risk_multiplier=conviction_risk_multiplier,
+                effective_risk_pct=eff_risk_pct,
+                anti_martingale_multiplier=am_mult,
+                risk_mode=risk_mode,
+            )
+
         decision = self._exposure.check(
             account=account,
             positions=positions,
+            symbol=symbol,
             proposed_notional=proposed_notional,
             bot_managed_notional=bot_managed_notional,
         )

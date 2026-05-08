@@ -76,6 +76,7 @@ from risk.position_sizer import PositionSizer
 from strategies.base import Signal, SignalAction, StrategyContext
 from strategies.ml_filter import MLSignalFilter
 from strategies.rsi_mean_reversion import RSIMeanReversionStrategy
+from strategies.indicators import atr as atr_indicator
 from strategies.skip_diagnostics import (
     SkipCodes,
     SkipDiagnosticsThrottle,
@@ -97,6 +98,7 @@ from strategies.sentiment import (
     sentiment_overlay_neutral,
 )
 from strategies.universe import UniverseFilter
+from services.regime_detector import QqqRegimeDetector
 from utils.tearsheet import tearsheet_primary
 from utils.time_utils import now_eastern, now_utc, today_eastern
 
@@ -111,6 +113,13 @@ _TIMEFRAME_SECONDS: dict[str, float] = {
     "1Hour": 3600.0,
     "1Day": 86400.0,
 }
+
+
+def _fmt_qty(qty: float | int) -> str:
+    q = float(qty)
+    if abs(q - round(q)) < 1e-9:
+        return str(int(round(q)))
+    return f"{q:.6f}".rstrip("0").rstrip(".")
 
 
 class Orchestrator:
@@ -209,6 +218,9 @@ class Orchestrator:
         self._shutdown_completed = False
         self._shutdown_flatten_live_positions = False
         self._canary_gate_label: str = "n/a"
+        self._regime_detector: QqqRegimeDetector | None = None
+        self._exec_risk_entry_ix: dict[str, int] = {}
+        self._exec_risk_trail: dict[str, float] = {}
 
     def set_canary_gate_label(self, label: str) -> None:
         self._canary_gate_label = label[:120]
@@ -218,6 +230,49 @@ class Orchestrator:
 
         self._shutdown_flatten_live_positions = True
         self._stop.set()
+
+    @staticmethod
+    def _is_auth_error(exc: BaseException) -> bool:
+        """Best-effort 401 / auth detection across wrapped exception chains."""
+
+        seen: set[int] = set()
+        stack: list[BaseException] = [exc]
+        while stack:
+            cur = stack.pop()
+            cid = id(cur)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            txt = f"{type(cur).__name__}: {cur}".lower()
+            if any(
+                token in txt
+                for token in (
+                    "401",
+                    "unauthorized",
+                    "forbidden",
+                    "invalid api key",
+                    "auth",
+                    "permission denied",
+                )
+            ):
+                return True
+            cause = getattr(cur, "__cause__", None)
+            ctx = getattr(cur, "__context__", None)
+            if isinstance(cause, BaseException):
+                stack.append(cause)
+            if isinstance(ctx, BaseException):
+                stack.append(ctx)
+        return False
+
+    def _log_auth_hint_if_needed(self, exc: BaseException, *, phase: str) -> None:
+        if not self._is_auth_error(exc):
+            return
+        self._log.critical(
+            "AUTH ERROR: Check if your .env Alpaca Keys match your PAPER/LIVE mode. "
+            "phase=%s err=%s",
+            phase,
+            exc,
+        )
 
     async def run_ml_startup_gate(self) -> bool:
         """Pre-boot ML training using SQLite only. Returns False to abort process."""
@@ -331,6 +386,7 @@ class Orchestrator:
         return gate_ok
 
     async def boot(self) -> None:
+        symbols_csv = ",".join(self._settings.symbols_list)
         self._log.info(
             "Boot: env=%s live_enabled=%s dry_run=%s reg_mode=%s symbols=%s",
             self._settings.ALPACA_ENV,
@@ -338,6 +394,11 @@ class Orchestrator:
             self._settings.DRY_RUN,
             self._settings.REGULATORY_MODE,
             self._settings.symbols_list,
+        )
+        self._log.info(
+            "event=startup_symbols_loaded symbols_count=%s symbols_csv=%s",
+            len(self._settings.symbols_list),
+            symbols_csv,
         )
 
         with contextlib.suppress(Exception):
@@ -368,6 +429,11 @@ class Orchestrator:
             max_attempts=self._settings.RETRY_MAX_ATTEMPTS,
             base_delay=self._settings.RETRY_BASE_DELAY_SECONDS,
             max_delay=self._settings.RETRY_MAX_DELAY_SECONDS,
+        )
+        self._regime_detector = (
+            QqqRegimeDetector(self._settings, self._bar_fetcher)
+            if self._settings.QQQ_REGIME_ENABLED
+            else None
         )
         self._order_service = OrderService(
             self._clients.trading,
@@ -571,6 +637,7 @@ class Orchestrator:
         try:
             await self.boot()
         except Exception as exc:  # noqa: BLE001
+            self._log_auth_hint_if_needed(exc, phase="boot")
             self._log.exception("Boot failed: %s", exc)
             raise
 
@@ -815,6 +882,11 @@ class Orchestrator:
             if wo.symbol
         }
 
+        for dead in list(self._exec_risk_entry_ix.keys()):
+            if dead not in positions_by_symbol:
+                self._exec_risk_entry_ix.pop(dead, None)
+                self._exec_risk_trail.pop(dead, None)
+
         held = {p.symbol.upper() for p in self._latest_positions if p.side.lower() == "long"}
         tick_syms = symbols_for_strategy_ticks(
             self._settings,
@@ -835,6 +907,10 @@ class Orchestrator:
         t_mode, t_mult, _t_r = resolve_anti_martingale(self._settings, tick_recent)
         t_preview = recent_trade_pnls_preview(tick_recent, 12)
         self._tick_anti_mart = (t_mode, t_mult, t_preview)
+
+        tick_now = now_utc()
+        if self._regime_detector is not None:
+            self._regime_detector.refresh_if_stale(now_utc=tick_now)
 
         for symbol in tick_syms:
             sym = symbol.upper()
@@ -878,6 +954,17 @@ class Orchestrator:
                     continue
             if bar_age_s is None or bar_age_s > max_bar_age_s:
                 sector = self._settings.sector_for_symbol(sym)
+                self._log_strategy.info(
+                    "event=strategy_bar_stale symbol=%s last_bar_time=%s current_time=%s "
+                    "bar_age_seconds=%s max_bar_age_seconds=%.3f bar_rows=%s",
+                    sym,
+                    latest_bar_ts.isoformat() if latest_bar_ts is not None else "n_a",
+                    now_eval.isoformat(),
+                    f"{bar_age_s:.3f}" if bar_age_s is not None else "n_a",
+                    max_bar_age_s,
+                    len(bars),
+                    extra={"symbol": sym, "skip_code": SkipCodes.STALE_BARS},
+                )
                 self._emit_orchestrator_enter_skip(
                     SkipReason(
                         code=SkipCodes.STALE_BARS,
@@ -908,6 +995,22 @@ class Orchestrator:
                 extra={"symbol": sym},
             )
 
+            pos_chk = positions_by_symbol.get(sym)
+            if (
+                pos_chk is not None
+                and str(pos_chk.side).lower() == "long"
+                and bars is not None
+                and not bars.empty
+            ):
+                min_q = (
+                    float(self._settings.FRACTIONAL_MIN_QTY)
+                    if self._settings.ENABLE_FRACTIONAL
+                    else float(self._settings.MIN_SHARES)
+                )
+                if abs(float(pos_chk.qty)) + 1e-9 >= min_q:
+                    if await self._maybe_forced_execution_exit(sym, bars, quote):
+                        continue
+
             elig = self._universe.is_eligible(
                 sym,
                 quote=quote,
@@ -933,6 +1036,9 @@ class Orchestrator:
                 anti_martingale_risk_mode=t_mode.value,
                 anti_martingale_multiplier=t_mult,
                 recent_trade_outcomes_hint=t_preview,
+                qqq_regime_bear_volatile=bool(
+                    self._regime_detector.snapshot.bear_volatile if self._regime_detector else False
+                ),
             )
 
             for signal in self._strategy.evaluate(ctx):
@@ -1108,6 +1214,7 @@ class Orchestrator:
             SkipCodes.ORDER_REJECTED,
             SkipCodes.RISK_LIMIT_FAIL,
             SkipCodes.SECTOR_LIMIT_FAIL,
+            SkipCodes.COMPLIANCE_REJECTED,
         }
         discord_sink = (
             (lambda spec, o=self: enqueue_discord_alert(o._discord_out, spec))
@@ -1140,6 +1247,70 @@ class Orchestrator:
     ) -> None:
         sym = signal.symbol
         coid_extra = {"symbol": sym, "strategy": self._strategy.name}
+        sig_meta = getattr(signal, "metadata", {}) or {}
+        is_scale_in = str(sig_meta.get("signal_type", "")).strip().lower() == "scale_in"
+
+        def _meta_float(v: object) -> float | None:
+            try:
+                if v is None:
+                    return None
+                x = float(v)
+                return x if x == x else None
+            except (TypeError, ValueError):
+                return None
+
+        def _scale_in_skip(
+            *,
+            skip_code: str,
+            reason: str,
+            public_code: str = SkipCodes.RISK_LIMIT_FAIL,
+            quote_age_seconds: float | None = None,
+            risk_qty: float | None = None,
+            extra_meta: dict[str, Any] | None = None,
+        ) -> None:
+            if not is_scale_in:
+                return
+            self._log_strategy.info(
+                "event=scale_in_skip symbol=%s skip_code=%s reason=%s rsi=%s adx=%s "
+                "price=%s current_qty=%s proposed_add_qty=%s bullet_number=%s max_bullets=%s "
+                "spread_pct=%s quote_age_seconds=%s strategy_bar_ts=%s",
+                sym,
+                skip_code,
+                reason,
+                str(sig_meta.get("rsi", "n_a")),
+                str(sig_meta.get("adx", "n_a")),
+                str(sig_meta.get("last_close", signal.reference_price)),
+                str(sig_meta.get("position_qty", "n_a")),
+                str(sig_meta.get("proposed_add_qty", "n_a")),
+                str(sig_meta.get("bullet_number", "n_a")),
+                str(sig_meta.get("max_bullets", "n_a")),
+                str(sig_meta.get("spread_pct", "n_a")),
+                f"{quote_age_seconds:.3f}" if quote_age_seconds is not None else "n_a",
+                str(sig_meta.get("bar_timestamp", "n_a")),
+                extra={"symbol": sym, "strategy": self._strategy.name, "skip_code": skip_code},
+            )
+            self._emit_orchestrator_enter_skip(
+                SkipReason(
+                    code=public_code,
+                    message=f"{skip_code}: {reason}",
+                    symbol=sym,
+                    rsi=_meta_float(sig_meta.get("rsi")),
+                    adx=_meta_float(sig_meta.get("adx")),
+                    atr=_meta_float(sig_meta.get("atr")),
+                    price=_meta_float(sig_meta.get("last_close")) or _meta_float(signal.reference_price),
+                    sma_200=_meta_float(sig_meta.get("sma200")),
+                    sma_200_slope=_meta_float(sig_meta.get("sma_slope")),
+                    bid=float(quote.bid) if quote is not None else None,
+                    ask=float(quote.ask) if quote is not None else None,
+                    spread_pct=_meta_float(sig_meta.get("spread_pct")),
+                    quote_age_seconds=quote_age_seconds,
+                    risk_qty=risk_qty,
+                    metadata={
+                        "scale_in_skip_code": skip_code,
+                        **(extra_meta or {}),
+                    },
+                ),
+            )
 
         if signal.action == SignalAction.NONE:
             return
@@ -1147,6 +1318,13 @@ class Orchestrator:
         if signal.action == SignalAction.ENTER_LONG:
             sector = self._settings.sector_for_symbol(sym)
             if self._kill_switch.is_latched():
+                if is_scale_in:
+                    _scale_in_skip(
+                        skip_code="scale_in_kill_switch_latched",
+                        reason="kill_switch_latched blocks_new_long_entries",
+                        public_code=SkipCodes.KILL_SWITCH_LATCHED,
+                    )
+                    return
                 self._emit_orchestrator_enter_skip(
                     SkipReason(
                         code=SkipCodes.KILL_SWITCH_LATCHED,
@@ -1157,6 +1335,13 @@ class Orchestrator:
                 )
                 return
             if not can_open:
+                if is_scale_in:
+                    _scale_in_skip(
+                        skip_code="scale_in_market_closed",
+                        reason="market_or_bot_window_closed_for_new_entries",
+                        public_code=SkipCodes.MARKET_CLOSED,
+                    )
+                    return
                 self._emit_orchestrator_enter_skip(
                     SkipReason(
                         code=SkipCodes.MARKET_CLOSED,
@@ -1167,6 +1352,13 @@ class Orchestrator:
                 )
                 return
             if not compliance_allow:
+                if is_scale_in:
+                    _scale_in_skip(
+                        skip_code="scale_in_compliance_rejected",
+                        reason="compliance_adapter_disallows_new_entries_this_session",
+                        public_code=SkipCodes.COMPLIANCE_REJECTED,
+                    )
+                    return
                 self._emit_orchestrator_enter_skip(
                     SkipReason(
                         code=SkipCodes.RISK_LIMIT_FAIL,
@@ -1176,7 +1368,7 @@ class Orchestrator:
                     ),
                 )
                 return
-            if not eligible:
+            if (not is_scale_in) and (not eligible):
                 self._emit_orchestrator_enter_skip(
                     SkipReason(
                         code=SkipCodes.UNIVERSE_INELIGIBLE,
@@ -1191,6 +1383,13 @@ class Orchestrator:
                 )
                 return
             if quote is None:
+                if is_scale_in:
+                    _scale_in_skip(
+                        skip_code="scale_in_stale_quote",
+                        reason="no_quote_at_execution_layer after_strategy_emitted_enter",
+                        public_code=SkipCodes.QUOTE_INVALID,
+                    )
+                    return
                 self._emit_orchestrator_enter_skip(
                     SkipReason(
                         code=SkipCodes.QUOTE_INVALID,
@@ -1201,6 +1400,13 @@ class Orchestrator:
                 )
                 return
             if not self._stream_health.all_ok:
+                if is_scale_in:
+                    _scale_in_skip(
+                        skip_code="scale_in_stream_unhealthy",
+                        reason="quote_or_stream_health_gate_failed",
+                        public_code=SkipCodes.STREAM_UNHEALTHY,
+                    )
+                    return
                 self._emit_orchestrator_enter_skip(
                     SkipReason(
                         code=SkipCodes.STREAM_UNHEALTHY,
@@ -1213,7 +1419,7 @@ class Orchestrator:
 
             max_per_sector = int(self._settings.MAX_OPEN_POSITIONS_PER_SECTOR)
             open_in_sector = self._open_sector_symbols(sector)
-            if len(open_in_sector) >= max_per_sector:
+            if (not is_scale_in) and len(open_in_sector) >= max_per_sector:
                 self._emit_orchestrator_enter_skip(
                     SkipReason(
                         code=SkipCodes.SECTOR_LIMIT_FAIL,
@@ -1235,6 +1441,41 @@ class Orchestrator:
 
             corr_block = self._maybe_correlation_block(sym)
 
+            regime_mult = 1.0
+            if self._regime_detector is not None:
+                rs = self._regime_detector.snapshot
+                if rs.bear_volatile:
+                    if bool(self._settings.REGIME_BEAR_VOLATILE_BLOCK_ENTRIES):
+                        if is_scale_in:
+                            _scale_in_skip(
+                                skip_code="scale_in_macro_regime",
+                                reason="QQQ_BearVolatile_block_entries",
+                                public_code=SkipCodes.SKIP_MARKET_REGIME,
+                                extra_meta={
+                                    "QQQ_ATR_ratio": rs.atr_ratio,
+                                    "QQQ_close": rs.close,
+                                },
+                            )
+                        else:
+                            self._emit_orchestrator_enter_skip(
+                                SkipReason(
+                                    code=SkipCodes.SKIP_MARKET_REGIME,
+                                    message="QQQ_BearVolatile_macro_gate_blocks_entry",
+                                    symbol=sym,
+                                    metadata={
+                                        "QQQ_ATR_ratio": rs.atr_ratio,
+                                        "QQQ_close": rs.close,
+                                        "QQQ_sma50": rs.sma50,
+                                        "sector": sector,
+                                    },
+                                ),
+                            )
+                        return
+                    regime_mult = max(
+                        0.0,
+                        1.0 - float(self._settings.REGIME_MAX_EQUITY_REDUCTION),
+                    )
+
             try:
                 conv_mult = float(signal.metadata.get("conviction_risk_multiplier", 1.0))
             except (TypeError, ValueError):
@@ -1254,76 +1495,169 @@ class Orchestrator:
                 anti_martingale_multiplier=am_mult,
                 risk_mode=am_mode.value,
                 recent_trade_hint=am_preview,
+                regime_equity_multiplier=regime_mult,
             )
             min_shares = float(self._settings.MIN_SHARES)
-            if sizing.shares < min_shares:
-                sm = getattr(signal, "metadata", {}) or {}
+            if self._settings.ENABLE_FRACTIONAL:
+                min_shares = min(min_shares, float(self._settings.FRACTIONAL_MIN_QTY))
+            requested_scale_qty = float(
+                _meta_float(sig_meta.get("proposed_add_qty")) or float(self._settings.SCALE_IN_ADD_QTY),
+            )
+            if requested_scale_qty <= 0:
+                requested_scale_qty = float(self._settings.FRACTIONAL_MIN_QTY if self._settings.ENABLE_FRACTIONAL else 1.0)
+            if not self._settings.ENABLE_FRACTIONAL:
+                requested_scale_qty = float(int(round(requested_scale_qty)))
+                if requested_scale_qty < 1.0:
+                    requested_scale_qty = 1.0
 
-                def _fmeta(v: object) -> float | None:
-                    try:
-                        if v is None:
-                            return None
-                        x = float(v)
-                        return x if x == x else None
-                    except (TypeError, ValueError):
-                        return None
+            is_corr = bool(corr_block) or (
+                sizing.skipped_reason is not None
+                and "correlation" in str(sizing.skipped_reason).lower()
+            )
+            scale_in_current_qty: float | None = None
+            scale_in_existing_risk_usd: float | None = None
+            scale_in_added_risk_usd: float | None = None
+            scale_in_total_risk_usd: float | None = None
+            scale_in_max_allowed_risk_usd: float | None = None
+            scale_in_stop_distance: float | None = None
 
-                lc = _fmeta(sm.get("last_close")) or _fmeta(signal.reference_price)
-                is_corr = bool(corr_block) or (
-                    sizing.skipped_reason is not None
-                    and "correlation" in str(sizing.skipped_reason).lower()
-                )
-                sk_code = SkipCodes.RISK_LIMIT_FAIL if is_corr else SkipCodes.SIZE_ZERO
-                self._emit_orchestrator_enter_skip(
-                    SkipReason(
-                        code=sk_code,
-                        message=(
-                            "cannot_allocate_positive_share_count "
-                            f"skipped_reason={str(sizing.skipped_reason)} "
-                            f"rationale={str(sizing.rationale)}"[:480]
-                        ),
-                        symbol=sym,
-                        rsi=_fmeta(sm.get("rsi")),
-                        price=lc,
-                        sma_200=_fmeta(sm.get("sma200")),
-                        sma_200_slope=_fmeta(sm.get("sma_slope")),
-                        adx=_fmeta(sm.get("adx")),
-                        atr=_fmeta(sm.get("atr")),
-                        bid=float(quote.bid) if quote is not None else None,
-                        ask=float(quote.ask) if quote is not None else None,
-                        spread_pct=_fmeta(sm.get("spread_pct")),
-                        quote_age_seconds=float(quote.age_seconds()) if quote is not None else None,
+            if is_scale_in:
+                current_pos = self._position_for(sym)
+                current_qty = abs(float(current_pos.qty)) if current_pos is not None else 0.0
+                scale_in_current_qty = current_qty
+                quote_age = float(quote.age_seconds()) if quote is not None else None
+                if current_pos is None or current_qty <= 0:
+                    _scale_in_skip(
+                        skip_code="scale_in_bullet_count_unknown",
+                        reason="position_snapshot_missing_or_zero_qty",
+                        public_code=SkipCodes.UNKNOWN_SKIP,
+                        quote_age_seconds=quote_age,
+                    )
+                    return
+                if is_corr:
+                    _scale_in_skip(
+                        skip_code="scale_in_risk_exceeded",
+                        reason=f"correlation_blocked: {corr_block}",
+                        public_code=SkipCodes.RISK_LIMIT_FAIL,
+                        quote_age_seconds=quote_age,
                         risk_qty=float(sizing.shares),
-                        metadata={
+                        extra_meta={
                             "correlation_block": corr_block or "",
                             "sizer_skipped_reason": sizing.skipped_reason or "",
-                            "sizer_rationale": sizing.rationale or "",
-                            "risk_mode": sizing.risk_mode,
-                            "conviction_risk_multiplier": conv_mult,
-                            "max_dollars_per_trade": float(self._settings.max_dollars_per_trade),
-                            "raw_shares": sizing.risk_budget / sizing.stop_distance
-                            if sizing.stop_distance > 0
-                            else 0.0,
-                            "final_shares": float(sizing.shares),
-                            "fractional_enabled": str(self._settings.ENABLE_FRACTIONAL).lower(),
-                            "sector": sector,
-                            "open_in_sector": len(open_in_sector),
-                            "max_open_positions_per_sector": max_per_sector,
                         },
-                    ),
+                    )
+                    return
+                if sizing.shares + 1e-9 < requested_scale_qty:
+                    _scale_in_skip(
+                        skip_code="scale_in_risk_exceeded",
+                        reason=(
+                            "position_sizer_allocation_below_requested_scale_qty "
+                            f"alloc={sizing.shares:.6f} requested={requested_scale_qty:.6f}"
+                        ),
+                        public_code=SkipCodes.RISK_LIMIT_FAIL,
+                        quote_age_seconds=quote_age,
+                        risk_qty=float(sizing.shares),
+                        extra_meta={
+                            "sizer_skipped_reason": sizing.skipped_reason or "",
+                            "sizer_rationale": sizing.rationale or "",
+                        },
+                    )
+                    return
+                stop_distance = (
+                    _meta_float(sig_meta.get("scale_in_stop_distance"))
+                    or (float(sizing.stop_distance) if sizing.stop_distance > 0 else 0.0)
+                    or float(signal.atr) * float(self._settings.ATR_STOP_MULTIPLIER)
                 )
-                return
+                scale_in_stop_distance = stop_distance
+                if stop_distance <= 0:
+                    _scale_in_skip(
+                        skip_code="scale_in_risk_exceeded",
+                        reason="non_positive_stop_distance_for_risk_guard",
+                        public_code=SkipCodes.RISK_LIMIT_FAIL,
+                        quote_age_seconds=quote_age,
+                        risk_qty=float(sizing.shares),
+                    )
+                    return
+                existing_risk_usd = current_qty * stop_distance
+                added_risk_usd = requested_scale_qty * stop_distance
+                total_risk_usd = existing_risk_usd + added_risk_usd
+                max_allowed_risk_usd = float(sizing.risk_budget)
+                scale_in_existing_risk_usd = existing_risk_usd
+                scale_in_added_risk_usd = added_risk_usd
+                scale_in_total_risk_usd = total_risk_usd
+                scale_in_max_allowed_risk_usd = max_allowed_risk_usd
+                if total_risk_usd > max_allowed_risk_usd + 1e-9:
+                    _scale_in_skip(
+                        skip_code="scale_in_risk_exceeded",
+                        reason=(
+                            "combined_position_risk_exceeds_limit "
+                            f"existing={existing_risk_usd:.6f} add={added_risk_usd:.6f} "
+                            f"total={total_risk_usd:.6f} max={max_allowed_risk_usd:.6f}"
+                        ),
+                        public_code=SkipCodes.RISK_LIMIT_FAIL,
+                        quote_age_seconds=quote_age,
+                        risk_qty=float(requested_scale_qty),
+                        extra_meta={
+                            "current_qty": current_qty,
+                            "proposed_add_qty": requested_scale_qty,
+                            "avg_entry_price": float(current_pos.avg_entry_price),
+                            "current_price": float(signal.reference_price or quote.bid),
+                            "stop_price": float(current_pos.avg_entry_price - stop_distance),
+                            "existing_risk_usd": existing_risk_usd,
+                            "added_risk_usd": added_risk_usd,
+                            "total_risk_usd": total_risk_usd,
+                            "max_allowed_risk_usd": max_allowed_risk_usd,
+                        },
+                    )
+                    return
+                order_qty = float(requested_scale_qty)
+            else:
+                if sizing.shares < min_shares:
+                    lc = _meta_float(sig_meta.get("last_close")) or _meta_float(signal.reference_price)
+                    sk_code = SkipCodes.RISK_LIMIT_FAIL if is_corr else SkipCodes.SIZE_ZERO
+                    self._emit_orchestrator_enter_skip(
+                        SkipReason(
+                            code=sk_code,
+                            message=(
+                                "cannot_allocate_positive_share_count "
+                                f"skipped_reason={str(sizing.skipped_reason)} "
+                                f"rationale={str(sizing.rationale)}"[:480]
+                            ),
+                            symbol=sym,
+                            rsi=_meta_float(sig_meta.get("rsi")),
+                            price=lc,
+                            sma_200=_meta_float(sig_meta.get("sma200")),
+                            sma_200_slope=_meta_float(sig_meta.get("sma_slope")),
+                            adx=_meta_float(sig_meta.get("adx")),
+                            atr=_meta_float(sig_meta.get("atr")),
+                            bid=float(quote.bid) if quote is not None else None,
+                            ask=float(quote.ask) if quote is not None else None,
+                            spread_pct=_meta_float(sig_meta.get("spread_pct")),
+                            quote_age_seconds=float(quote.age_seconds()) if quote is not None else None,
+                            risk_qty=float(sizing.shares),
+                            metadata={
+                                "correlation_block": corr_block or "",
+                                "sizer_skipped_reason": sizing.skipped_reason or "",
+                                "sizer_rationale": sizing.rationale or "",
+                                "risk_mode": sizing.risk_mode,
+                                "conviction_risk_multiplier": conv_mult,
+                                "max_dollars_per_trade": float(self._settings.max_dollars_per_trade),
+                                "raw_shares": sizing.risk_budget / sizing.stop_distance
+                                if sizing.stop_distance > 0
+                                else 0.0,
+                                "final_shares": float(sizing.shares),
+                                "fractional_enabled": str(self._settings.ENABLE_FRACTIONAL).lower(),
+                                "sector": sector,
+                                "open_in_sector": len(open_in_sector),
+                                "max_open_positions_per_sector": max_per_sector,
+                            },
+                        ),
+                    )
+                    return
+                order_qty = float(sizing.shares)
 
             sym_u = sym.upper()
-            meta = getattr(signal, "metadata", {}) or {}
-            def _meta_float(v: object) -> float | None:
-                try:
-                    if v is None:
-                        return None
-                    x = float(v)
-                    return x if x == x else None
-                except (TypeError, ValueError):
-                    return None
+            meta = sig_meta
 
             audit = {
                 "opened_at": datetime.now(UTC).isoformat(),
@@ -1343,6 +1677,16 @@ class Orchestrator:
                 "rsi_threshold_used": meta.get("rsi_threshold_used"),
                 "sma_filter_passed": meta.get("sma_filter_passed"),
                 "aggressive_sma_bypassed": meta.get("aggressive_sma_bypassed"),
+                "bollinger_width_pct": meta.get("bollinger_width_pct"),
+                "bollinger_lower": meta.get("bollinger_lower"),
+                "vwap_distance_pct": meta.get("vwap_distance_pct"),
+                "vwap_lower": meta.get("vwap_lower"),
+                "signal_type": meta.get("signal_type", "entry"),
+                "bullet_number": meta.get("bullet_number"),
+                "max_bullets": meta.get("max_bullets"),
+                "underwater_pct": meta.get("underwater_pct"),
+                "position_qty": meta.get("position_qty"),
+                "proposed_add_qty": meta.get("proposed_add_qty"),
                 "sector": meta.get("sector") or sector,
                 "open_in_sector": len(open_in_sector),
             }
@@ -1350,10 +1694,21 @@ class Orchestrator:
             self._entry_audit[sym_u] = audit
             try:
                 wo: WorkingOrder | None
-                if self._settings.PASSIVE_JOINER_ENABLED:
+                if self._settings.MIDPOINT_PEG_ENABLED:
+                    wo = await self._order_service.submit_midpoint_peg_async(
+                        sym_u,
+                        order_qty,
+                        "buy",
+                        quote_refresher=lambda s=sym_u: (
+                            self._quote_cache.get(s) if self._quote_cache else None
+                        )
+                        or self._rest_quote(s),
+                        intent_reason=str(signal.reason or "enter_long")[:480],
+                    )
+                elif self._settings.PASSIVE_JOINER_ENABLED:
                     wo = await self._order_service.submit_buy_passive_joiner_async(
                         sym_u,
-                        int(sizing.shares),
+                        order_qty,
                         quote_refresher=lambda s=sym_u: (
                             self._quote_cache.get(s) if self._quote_cache else None
                         )
@@ -1362,13 +1717,21 @@ class Orchestrator:
                 else:
                     wo = self._order_service.submit_limit_entry(
                         sym_u,
-                        int(sizing.shares),
+                        order_qty,
                         side="buy",
                         quote=quote,
                         intent_reason=str(signal.reason or "enter_long")[:480],
                     )
             except OrderPlacementError as exc:
                 self._entry_audit.pop(sym_u, None)
+                if is_scale_in:
+                    _scale_in_skip(
+                        skip_code="scale_in_order_rejected",
+                        reason=f"order_service_rejected_entry: {exc}",
+                        public_code=SkipCodes.ORDER_REJECTED,
+                        quote_age_seconds=float(quote.age_seconds()) if quote is not None else None,
+                        risk_qty=float(order_qty),
+                    )
                 self._emit_orchestrator_enter_skip(
                     SkipReason(
                         code=SkipCodes.ORDER_REJECTED,
@@ -1382,7 +1745,7 @@ class Orchestrator:
                         bid=float(quote.bid) if quote is not None else None,
                         ask=float(quote.ask) if quote is not None else None,
                         spread_pct=_meta_float(meta.get("spread_pct")),
-                        risk_qty=float(sizing.shares),
+                        risk_qty=float(order_qty),
                         metadata={
                             "max_dollars_per_trade": float(self._settings.max_dollars_per_trade),
                             "fractional_enabled": str(self._settings.ENABLE_FRACTIONAL).lower(),
@@ -1396,49 +1759,97 @@ class Orchestrator:
                 return
             if wo is None:
                 self._entry_audit.pop(sym_u, None)
-                self._emit_orchestrator_enter_skip(
-                    SkipReason(
-                        code=SkipCodes.UNKNOWN_SKIP,
-                        message="order_service_returned_none_without_exception",
-                        symbol=sym_u,
-                    ),
-                )
+                if self._settings.MIDPOINT_PEG_ENABLED:
+                    self._emit_orchestrator_enter_skip(
+                        SkipReason(
+                            code=SkipCodes.SKIP_MIDPOINT_TIMEOUT,
+                            message="midpoint_peg_give_up_no_fill_after_chase_cycles",
+                            symbol=sym_u,
+                            metadata={"skip_code": "skip_midpoint_timeout"},
+                        ),
+                    )
+                else:
+                    self._emit_orchestrator_enter_skip(
+                        SkipReason(
+                            code=SkipCodes.UNKNOWN_SKIP,
+                            message="order_service_returned_none_without_exception",
+                            symbol=sym_u,
+                        ),
+                    )
             elif str(wo.status).lower() != "dry_run":
                 risk_pct_hint = sizing.effective_risk_pct
-                base_lines = [
-                    f"symbol={sym_u}",
-                    f"sector={audit.get('sector','Unknown')}",
-                    f"qty={int(sizing.shares)} price={audit.get('entry_price')}",
-                    f"risk_pct_eff={risk_pct_hint:.6f}",
-                    f"regime={audit.get('regime_type','')}",
-                    f"sentiment={audit.get('sentiment_score','')}",
-                    f"rsi={audit.get('rsi','')}",
-                    f"adx={audit.get('adx','')}",
-                    f"atr_pct={audit.get('atr_pct','')}",
-                    f"vol_tier={audit.get('volatility_tier','')}",
-                    f"rsi_thr={audit.get('rsi_threshold_used','')}",
-                    f"sma_bypass={audit.get('aggressive_sma_bypassed','')}",
-                    f"open_in_sector={audit.get('open_in_sector','')}",
-                    f"spread_pct={audit.get('spread_pct','')}",
-                    f"source={'paper' if self._settings.ALPACA_ENV=='paper' else 'live'}",
-                ]
+                if is_scale_in:
+                    base_lines = [
+                        f"symbol={sym_u}",
+                        f"current_qty={scale_in_current_qty}",
+                        f"add_qty={_fmt_qty(order_qty)}",
+                        f"bullet={audit.get('bullet_number','n_a')} / {audit.get('max_bullets','n_a')}",
+                        f"avg_entry={meta.get('avg_entry_price','n_a')}",
+                        f"current_price={audit.get('entry_price','n_a')}",
+                        f"underwater_pct={audit.get('underwater_pct','n_a')}",
+                        f"rsi={audit.get('rsi','n_a')}",
+                        f"risk_after={scale_in_total_risk_usd} / {scale_in_max_allowed_risk_usd}",
+                        "reason=existing_position_underwater_and_secondary_rsi_triggered",
+                    ]
+                    title = "SCALE_IN_LONG"
+                    color = 0xF1C40F
+                else:
+                    base_lines = [
+                        f"symbol={sym_u}",
+                        f"sector={audit.get('sector','Unknown')}",
+                        f"qty={_fmt_qty(order_qty)} price={audit.get('entry_price')}",
+                        f"risk_pct_eff={risk_pct_hint:.6f}",
+                        f"regime={audit.get('regime_type','')}",
+                        f"sentiment={audit.get('sentiment_score','')}",
+                        f"rsi={audit.get('rsi','')}",
+                        f"adx={audit.get('adx','')}",
+                        f"atr_pct={audit.get('atr_pct','')}",
+                        f"vol_tier={audit.get('volatility_tier','')}",
+                        f"rsi_thr={audit.get('rsi_threshold_used','')}",
+                        f"sma_bypass={audit.get('aggressive_sma_bypassed','')}",
+                        f"open_in_sector={audit.get('open_in_sector','')}",
+                        f"spread_pct={audit.get('spread_pct','')}",
+                        f"source={'paper' if self._settings.ALPACA_ENV=='paper' else 'live'}",
+                    ]
+                    title = "ENTER_LONG"
+                    color = 0x2ECC71
                 enqueue_discord_alert(
                     self._discord_out,
                     {
-                        "title": "ENTER_LONG",
+                        "title": title,
                         "lines": base_lines,
-                        "color": 0x2ECC71,
+                        "color": color,
                     },
                 )
+            if is_scale_in and wo is not None:
+                self._log_strategy.info(
+                    "event=scale_in_signal symbol=%s action=BUY qty=%s rsi=%s underwater_pct=%s "
+                    "bullet_number=%s max_bullets=%s existing_risk_usd=%s added_risk_usd=%s "
+                    "total_risk_usd=%s max_allowed_risk_usd=%s stop_distance=%s",
+                    sym_u,
+                    _fmt_qty(order_qty),
+                    str(audit.get("rsi", "n_a")),
+                    str(audit.get("underwater_pct", "n_a")),
+                    str(audit.get("bullet_number", "n_a")),
+                    str(audit.get("max_bullets", "n_a")),
+                    str(scale_in_existing_risk_usd),
+                    str(scale_in_added_risk_usd),
+                    str(scale_in_total_risk_usd),
+                    str(scale_in_max_allowed_risk_usd),
+                    str(scale_in_stop_distance),
+                    extra={"symbol": sym_u},
+                )
             self._log_strategy.info(
-                "event=trade_decision decision=%s symbol=%s reason=entry_submitted sector=%s qty=%s "
+                "event=trade_decision decision=%s symbol=%s reason=%s sector=%s qty=%s "
                 "rsi=%s adx=%s atr_pct=%s volatility_tier=%s rsi_threshold=%s "
                 "price=%s sma200=%s sma_filter_passed=%s aggressive_sma_bypassed=%s "
-                "open_in_sector=%s bid=%s ask=%s spread_pct=%s latest_bar_ts=%s",
+                "bollinger_width_pct=%s vwap_distance_pct=%s open_in_sector=%s "
+                "bid=%s ask=%s spread_pct=%s latest_bar_ts=%s",
                 "ORDER_SUBMITTED" if wo is not None else "SKIP",
                 sym_u,
+                "scale_in_submitted" if is_scale_in else "entry_submitted",
                 str(audit.get("sector", sector)),
-                int(sizing.shares),
+                _fmt_qty(order_qty),
                 str(audit.get("rsi", "n_a")),
                 str(audit.get("adx", "n_a")),
                 str(audit.get("atr_pct", "n_a")),
@@ -1448,6 +1859,8 @@ class Orchestrator:
                 str(meta.get("sma200", "n_a")),
                 str(audit.get("sma_filter_passed", "n_a")),
                 str(audit.get("aggressive_sma_bypassed", "n_a")),
+                str(audit.get("bollinger_width_pct", "n_a")),
+                str(audit.get("vwap_distance_pct", "n_a")),
                 str(audit.get("open_in_sector", "n_a")),
                 f"{quote.bid:.6f}" if quote is not None else "n_a",
                 f"{quote.ask:.6f}" if quote is not None else "n_a",
@@ -1464,11 +1877,24 @@ class Orchestrator:
             position = self._position_for(sym)
             if position is None or quote is None:
                 return
-            qty = int(abs(position.qty))
-            if qty < 1:
+            qty = abs(float(position.qty))
+            min_qty = float(self._settings.FRACTIONAL_MIN_QTY) if self._settings.ENABLE_FRACTIONAL else 1.0
+            if qty + 1e-12 < min_qty:
                 return
             try:
-                self._order_service.submit_limit_exit(sym, qty, side="sell", quote=quote)
+                if self._settings.MIDPOINT_PEG_ENABLED:
+                    await self._order_service.submit_midpoint_peg_async(
+                        sym,
+                        qty,
+                        "sell",
+                        quote_refresher=lambda s=sym: (
+                            self._quote_cache.get(s) if self._quote_cache else None
+                        )
+                        or self._rest_quote(s),
+                        intent_reason=str(signal.reason or "exit_long")[:480],
+                    )
+                else:
+                    self._order_service.submit_limit_exit(sym, qty, side="sell", quote=quote)
                 bid = quote.bid if quote is not None else 0
                 ask = quote.ask if quote is not None else 0
                 mid = (bid + ask) / 2 if bid > 0 and ask > bid else bid
@@ -1478,7 +1904,7 @@ class Orchestrator:
                         "title": "EXIT_LONG",
                         "lines": [
                             f"symbol={sym}",
-                            f"qty={qty}",
+                            f"qty={_fmt_qty(qty)}",
                             f"px~{mid:.4f}",
                             str(signal.reason),
                         ],
@@ -1492,8 +1918,9 @@ class Orchestrator:
             position = self._position_for(sym)
             if position is None or quote is None:
                 return
-            qty = int(abs(position.qty))
-            if qty < 1:
+            qty = abs(float(position.qty))
+            min_qty = float(self._settings.FRACTIONAL_MIN_QTY) if self._settings.ENABLE_FRACTIONAL else 1.0
+            if qty + 1e-12 < min_qty:
                 return
             try:
                 self._order_service.submit_emergency_flatten(
@@ -1527,12 +1954,124 @@ class Orchestrator:
                 return p
         return None
 
+    async def _maybe_forced_execution_exit(
+        self,
+        sym: str,
+        bars: pd.DataFrame,
+        quote: Quote | None,
+    ) -> bool:
+        """ATR trailing + bar-count time stop at execution layer (long-only)."""
+
+        if not self._settings.EXEC_ATR_TRAIL_ENABLED and not (
+            self._settings.MAX_POSITION_BARS > 0
+        ):
+            return False
+        pos = self._position_for(sym)
+        if pos is None or str(pos.side).lower() != "long":
+            return False
+        qty = abs(float(pos.qty))
+        min_q = (
+            float(self._settings.FRACTIONAL_MIN_QTY)
+            if self._settings.ENABLE_FRACTIONAL
+            else float(self._settings.MIN_SHARES)
+        )
+        if qty + 1e-9 < min_q:
+            return False
+        if bars.empty or len(bars) < max(25, self._settings.ATR_LENGTH + 3):
+            return False
+
+        sym_u = sym.upper()
+        bar_idx = len(bars) - 1
+        if sym_u not in self._exec_risk_entry_ix:
+            self._exec_risk_entry_ix[sym_u] = bar_idx
+        entry_ix = self._exec_risk_entry_ix[sym_u]
+        bars_held = max(0, bar_idx - entry_ix)
+
+        close = float(bars["close"].iloc[-1])
+        atr_s = atr_indicator(
+            bars["high"].astype(float),
+            bars["low"].astype(float),
+            bars["close"].astype(float),
+            length=int(self._settings.ATR_LENGTH),
+        )
+        atr5 = float(atr_s.iloc[-1]) if not pd.isna(atr_s.iloc[-1]) else 0.0
+        entry_px = float(pos.avg_entry_price)
+        k = float(self._settings.ATR_TRAIL_MULTIPLIER)
+
+        reason = ""
+        trail = self._exec_risk_trail.get(sym_u)
+        if self._settings.EXEC_ATR_TRAIL_ENABLED and atr5 > 0:
+            if trail is None:
+                trail = entry_px - k * atr5
+            else:
+                trail = max(float(trail), close - k * atr5)
+            self._exec_risk_trail[sym_u] = float(trail)
+            if close <= float(trail) + 1e-12:
+                reason = "trail"
+
+        if not reason and self._settings.MAX_POSITION_BARS > 0:
+            if bars_held >= int(self._settings.MAX_POSITION_BARS):
+                reason = "time"
+
+        if not reason:
+            return False
+
+        q = quote
+        if q is None or not q.is_fresh(self._settings.QUOTE_STALENESS_SECONDS):
+            q = self._rest_quote(sym_u)
+        if q is None:
+            self._log_strategy.info(
+                "event=strategy_skip symbol=%s skip_code=skip_time_exit_cancelled reason=no_quote_for_exit",
+                sym_u,
+                extra={"symbol": sym_u},
+            )
+            return False
+
+        ev = "exit_trail_stop" if reason == "trail" else "exit_time_stop"
+        self._log_strategy.info(
+            "event=%s symbol=%s stop=%.6f close=%.6f bars_held=%d atr5=%.6f k=%.4f reason=%s",
+            ev,
+            sym_u,
+            float(self._exec_risk_trail.get(sym_u, close)),
+            close,
+            bars_held,
+            atr5,
+            k,
+            reason,
+            extra={"symbol": sym_u, "skip_code": ev},
+        )
+
+        try:
+            if self._settings.MIDPOINT_PEG_ENABLED:
+                await self._order_service.submit_midpoint_peg_async(
+                    sym_u,
+                    qty,
+                    "sell",
+                    quote_refresher=lambda s=sym_u: (
+                        self._quote_cache.get(s) if self._quote_cache else None
+                    )
+                    or self._rest_quote(s),
+                    intent_reason=ev,
+                )
+            else:
+                self._order_service.submit_limit_exit(sym_u, qty, side="sell", quote=q)
+        except OrderPlacementError as exc:
+            self._log_strategy.info(
+                "event=strategy_skip symbol=%s skip_code=skip_trail_exit_failed err=%s",
+                sym_u,
+                exc,
+                extra={"symbol": sym_u},
+            )
+            return False
+        return True
+
     async def _refresh_account_state(self) -> None:
         try:
             self._latest_account = self._account_adapter.fetch_account()
             self._latest_positions = self._account_adapter.fetch_positions()
             self._latest_open_orders = len(self._account_adapter.fetch_open_orders() or [])
         except BrokerConnectionError as exc:
+            self._log_auth_hint_if_needed(exc, phase="account_refresh")
             self._log.warning("Account refresh failed: %s", exc)
 
     def _warmup_bars(self, symbols: list[str] | None = None) -> None:
@@ -1703,8 +2242,9 @@ class Orchestrator:
                     continue
             if quote is None:
                 continue
-            qty = int(abs(position.qty))
-            if qty < 1:
+            qty = abs(float(position.qty))
+            min_qty = float(self._settings.FRACTIONAL_MIN_QTY) if self._settings.ENABLE_FRACTIONAL else 1.0
+            if qty + 1e-12 < min_qty:
                 continue
             side = "sell" if str(position.side).lower() == "long" else "buy"
             try:

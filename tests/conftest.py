@@ -66,6 +66,7 @@ def make_settings(**overrides):
         "MIN_PRICE": 5.0,
         "MIN_AVG_DOLLAR_VOLUME": 0.0,
         "ENABLE_FRACTIONAL": False,
+        "TIME_OF_DAY_FILTER_ENABLED": False,
         "KILL_SWITCH_DRAWDOWN_PCT": 0.05,
         "EMERGENCY_AGGRESSIVENESS_PCT": 0.0015,
         "HEARTBEAT_INTERVAL_SECONDS": 60.0,

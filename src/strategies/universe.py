@@ -41,6 +41,50 @@ class EligibilityResult:
     code: str
 
 
+def compute_elastic_spread_cap(
+    settings: Settings,
+    *,
+    quote: Quote,
+    ref_price: float,
+    quote_age_seconds: float,
+) -> tuple[float, dict[str, Any]]:
+    """Return spread cap (fraction) with elasticity metadata."""
+
+    base_cap = float(settings.spread_filter_pct_for_feed(quote.feed))
+    max_cap = float(settings.SPREAD_FILTER_MAX_PCT)
+    if not bool(settings.SPREAD_FILTER_ELASTIC_ENABLED):
+        return min(base_cap, max_cap), {"base_cap": base_cap, "elastic": False}
+
+    mult = 1.0
+    components: list[str] = []
+    feed = str(quote.feed or "").strip().lower()
+    if feed == "iex":
+        mult *= float(settings.SPREAD_FILTER_IEX_ELASTIC_MULTIPLIER)
+        components.append("iex")
+    if ref_price <= float(settings.SPREAD_FILTER_LOW_PRICE_THRESHOLD):
+        mult *= float(settings.SPREAD_FILTER_LOW_PRICE_MULTIPLIER)
+        components.append("low_price")
+    sparse_threshold = float(settings.SPREAD_FILTER_SPARSE_SIZE_THRESHOLD)
+    if float(quote.bid_size) <= sparse_threshold or float(quote.ask_size) <= sparse_threshold:
+        mult *= float(settings.SPREAD_FILTER_SPARSE_QUOTE_MULTIPLIER)
+        components.append("sparse_quote")
+    fresh_cut = float(settings.QUOTE_STALENESS_SECONDS) * float(
+        settings.SPREAD_FILTER_FRESH_AGE_FRACTION,
+    )
+    if quote_age_seconds <= fresh_cut:
+        mult *= float(settings.SPREAD_FILTER_FRESH_QUOTE_MULTIPLIER)
+        components.append("fresh_quote")
+
+    elastic_cap = min(base_cap * mult, max_cap)
+    return elastic_cap, {
+        "base_cap": base_cap,
+        "elastic": True,
+        "elastic_mult": mult,
+        "elastic_components": ",".join(components) if components else "none",
+        "spread_cap_max_pct": max_cap,
+    }
+
+
 class UniverseFilter:
     """Apply price, liquidity, and quote-quality filters to a symbol."""
 
@@ -70,40 +114,12 @@ class UniverseFilter:
         ref_price: float,
         quote_age_seconds: float,
     ) -> tuple[float, dict[str, Any]]:
-        base_cap = float(self._settings.spread_filter_pct_for_feed(quote.feed))
-        max_cap = float(self._settings.SPREAD_FILTER_MAX_PCT)
-        if not bool(self._settings.SPREAD_FILTER_ELASTIC_ENABLED):
-            return min(base_cap, max_cap), {"base_cap": base_cap, "elastic": False}
-
-        mult = 1.0
-        components: list[str] = []
-        feed = str(quote.feed or "").strip().lower()
-        if feed == "iex":
-            mult *= float(self._settings.SPREAD_FILTER_IEX_ELASTIC_MULTIPLIER)
-            components.append("iex")
-        if ref_price <= float(self._settings.SPREAD_FILTER_LOW_PRICE_THRESHOLD):
-            mult *= float(self._settings.SPREAD_FILTER_LOW_PRICE_MULTIPLIER)
-            components.append("low_price")
-        sparse_threshold = float(self._settings.SPREAD_FILTER_SPARSE_SIZE_THRESHOLD)
-        if float(quote.bid_size) <= sparse_threshold or float(quote.ask_size) <= sparse_threshold:
-            mult *= float(self._settings.SPREAD_FILTER_SPARSE_QUOTE_MULTIPLIER)
-            components.append("sparse_quote")
-        fresh_cut = (
-            float(self._settings.QUOTE_STALENESS_SECONDS)
-            * float(self._settings.SPREAD_FILTER_FRESH_AGE_FRACTION)
+        return compute_elastic_spread_cap(
+            self._settings,
+            quote=quote,
+            ref_price=ref_price,
+            quote_age_seconds=quote_age_seconds,
         )
-        if quote_age_seconds <= fresh_cut:
-            mult *= float(self._settings.SPREAD_FILTER_FRESH_QUOTE_MULTIPLIER)
-            components.append("fresh_quote")
-
-        elastic_cap = min(base_cap * mult, max_cap)
-        return elastic_cap, {
-            "base_cap": base_cap,
-            "elastic": True,
-            "elastic_mult": mult,
-            "elastic_components": ",".join(components) if components else "none",
-            "spread_cap_max_pct": max_cap,
-        }
 
     def _log_spread_gate(
         self,

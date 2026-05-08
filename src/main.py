@@ -218,6 +218,31 @@ async def _amain() -> int:
             "symbols_count": str(len(orch_syms)),
         },
     )
+    log.info(
+        "event=startup_strategy_params symbols=%s vwap_enabled=%s vwap_z_threshold=%.4f "
+        "bollinger_enabled=%s bollinger_bw_min=%.6f bollinger_require_touch=%s "
+        "dynamic_rsi_enabled=%s dynamic_rsi_base=%.4f dynamic_rsi_short_atr=%s "
+        "dynamic_rsi_long_atr=%s adx_low=%.4f adx_high=%.4f time_filter_enabled=%s "
+        "trade_start_et=%s trade_end_et=%s enable_fractional=%s min_order_dollars=%.2f",
+        ",".join(orch_syms),
+        str(settings.VWAP_STRATEGY_ENABLED).lower(),
+        float(settings.VWAP_Z_THRESHOLD),
+        str(settings.BOLLINGER_ENABLED).lower(),
+        float(settings.BOLLINGER_MIN_WIDTH_PCT),
+        str(settings.BOLLINGER_REQUIRE_TOUCH).lower(),
+        str(settings.DYNAMIC_RSI_ENABLED).lower(),
+        float(settings.DYNAMIC_RSI_BASE),
+        int(settings.DYNAMIC_RSI_SHORT_ATR),
+        int(settings.DYNAMIC_RSI_LONG_ATR),
+        float(settings.ADX_LOW),
+        float(settings.ADX_HIGH),
+        str(settings.TIME_OF_DAY_FILTER_ENABLED).lower(),
+        settings.TIME_OF_DAY_TRADE_START,
+        settings.TIME_OF_DAY_TRADE_END,
+        str(settings.ENABLE_FRACTIONAL).lower(),
+        float(settings.MIN_ORDER_DOLLARS),
+        extra={"symbols": ",".join(orch_syms)},
+    )
 
     orchestrator.set_canary_gate_label("passed")
 

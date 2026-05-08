@@ -150,6 +150,42 @@ The full annotated reference lives in `.env.example`. The most important keys:
 
 ---
 
+## Hybrid VWAP/Bollinger Mean-Reversion Mode
+
+The default strategy remains the RSI mean-reversion engine, but the entry layer
+can now be made stricter and more adaptive for high-beta symbols by enabling
+VWAP and Bollinger gates together:
+
+```env
+DYNAMIC_RSI_ENABLED=true
+BOLLINGER_ENABLED=true
+BOLLINGER_BW_MIN=0.02
+BOLLINGER_REQUIRE_TOUCH=false
+VWAP_STRATEGY_ENABLED=true
+VWAP_Z_THRESHOLD=2.0
+ADX_LOW=20
+ADX_HIGH=40
+TIME_OF_DAY_FILTER_ENABLED=true
+TIME_OF_DAY_TRADE_START=10:00
+TIME_OF_DAY_TRADE_END=15:00
+ENABLE_FRACTIONAL=true
+MIN_ORDER_DOLLARS=10
+```
+
+Long entries require all configured entry gates to pass:
+
+- Time window: current evaluation time is inside the configured Eastern-time window.
+- VWAP deviation: completed-bar VWAP z-score is `<= -VWAP_Z_THRESHOLD`.
+- Bollinger volatility: BandWidth `(upper - lower) / middle` is at least `BOLLINGER_BW_MIN`.
+- RSI: current RSI is below the dynamic threshold `DYNAMIC_RSI_BASE * ATR(short) / ATR(long)`, clamped by `DYNAMIC_RSI_MIN/MAX`.
+- ADX: when `ADX >= ADX_HIGH`, VWAP z-score must be at least `1.5x` deeper than the configured threshold.
+- Risk/execution: spread, quote freshness, stale bars, open-order checks, kill switch, compliance, exposure, sentiment/correlation/ML gates, and order-service checks still run after the strategy signal.
+
+The strategy logs `event=strategy_candidate` for triggered candidates and
+structured skip diagnostics with `skip_code=...` for failed gates.
+
+---
+
 ## Strategy Time Machine & dashboard replay
 
 Historical **grid search** and **path-dependent simulation** live in `src/utils/backtester.py`. Bars are fetched with **Alpaca market data only** (`StockHistoricalDataClient`, adjusted bars). The backtester **never** imports the trading REST client, never submits orders, and never invokes Canary, Kill Switch, reconciliation, or live execution helpers.

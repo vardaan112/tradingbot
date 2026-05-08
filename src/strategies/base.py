@@ -53,6 +53,7 @@ class StrategyContext:
     now_utc: datetime
     feed: str
     sentiment_overlay: Optional[dict[str, Any]] = field(default=None)
+    qqq_regime_bear_volatile: bool = False
     anti_martingale_risk_mode: Optional[str] = None
     anti_martingale_multiplier: Optional[float] = None
     recent_trade_outcomes_hint: str = ""

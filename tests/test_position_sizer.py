@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from core.account import AccountSnapshot
+from core.account import AccountSnapshot, PositionSnapshot
 from risk.compliance import ComplianceAdapter
 from risk.exposure import ExposureChecker
 from risk.position_sizer import PositionSizer
@@ -235,3 +235,57 @@ def test_size_zero_reason_is_explicit_when_price_above_cap_and_no_fractionals(ma
     assert out.skipped_reason is not None
     assert "SIZE_ZERO" in out.skipped_reason
     assert "fractional_enabled=false" in out.skipped_reason
+
+
+def test_fractional_enabled_allows_sub_one_share_under_small_cap(make_settings_factory):
+    settings = make_settings_factory(
+        MAX_DOLLARS_PER_TRADE=50.0,
+        ENABLE_FRACTIONAL=True,
+        FRACTIONAL_MIN_QTY=0.001,
+        MIN_SHARES=1.0,
+        MAX_RISK_PER_TRADE_PCT=0.05,
+        ATR_STOP_MULTIPLIER=1.0,
+    )
+    sizer = _build(settings)
+    account = make_account(equity=25_000.0, buying_power=25_000.0, regt=25_000.0)
+    out = sizer.size(
+        symbol="IWM",
+        entry_price=280.0,
+        atr=0.50,
+        account=account,
+        positions=[],
+        bot_managed_notional=0.0,
+    )
+    assert out.shares > 0
+    assert out.shares < 1.0
+    assert out.notional <= 50.0
+
+
+def test_existing_symbol_add_not_blocked_by_max_open_positions(make_settings_factory):
+    settings = make_settings_factory(
+        MAX_OPEN_POSITIONS=1,
+        MAX_EQUITY_USAGE_USD=10_000.0,
+        MAX_GROSS_EXPOSURE_PCT=1.0,
+        ATR_STOP_MULTIPLIER=1.0,
+    )
+    sizer = _build(settings)
+    account = make_account(equity=100_000.0, buying_power=100_000.0, regt=100_000.0)
+    existing = PositionSnapshot(
+        symbol="TSLA",
+        qty=1.0,
+        avg_entry_price=100.0,
+        side="long",
+        market_value=100.0,
+        cost_basis=100.0,
+        unrealized_pl=0.0,
+        current_price=100.0,
+    )
+    out = sizer.size(
+        symbol="TSLA",
+        entry_price=100.0,
+        atr=2.0,
+        account=account,
+        positions=[existing],
+        bot_managed_notional=100.0,
+    )
+    assert out.shares >= 1.0

@@ -73,13 +73,42 @@ class Settings(BaseSettings):
 
     # ---- Strategy parameters -------------------------------------------------------
     RSI_LENGTH: int = Field(14, ge=2, le=200)
-    RSI_OVERSOLD: float = Field(30.0, ge=1.0, le=99.0)
+    RSI_OVERSOLD: float = Field(30.0, ge=1.0, le=50.0)
     RSI_EXIT: float = Field(50.0, ge=1.0, le=99.0)
-    DEFAULT_RSI_ENTRY: float = Field(30.0, ge=1.0, le=99.0)
-    HIGH_VOL_RSI_ENTRY: float = Field(35.0, ge=1.0, le=99.0)
+    DEFAULT_RSI_ENTRY: float = Field(30.0, ge=1.0, le=50.0)
+    HIGH_VOL_RSI_ENTRY: float = Field(35.0, ge=1.0, le=50.0)
     HIGH_VOL_ATR_PCT_THRESHOLD: float = Field(0.05, gt=0.0, le=1.0)
+    DYNAMIC_RSI_ENABLED: bool = False
+    DYNAMIC_RSI_BASE: float = Field(30.0, ge=1.0, le=50.0)
+    DYNAMIC_RSI_K: float = Field(2.0, ge=0.0, le=25.0)
+    DYNAMIC_RSI_MIN: float = Field(20.0, ge=1.0, le=50.0)
+    DYNAMIC_RSI_MAX: float = Field(35.0, ge=1.0, le=50.0)
+    ATR_LOOKBACK: int = Field(50, ge=2, le=500)
+    BOLLINGER_ENABLED: bool = False
+    BOLLINGER_LENGTH: int = Field(20, ge=2, le=500)
+    BOLLINGER_STD: float = Field(2.0, gt=0.0, le=10.0)
+    BOLLINGER_MIN_WIDTH_PCT: float = Field(0.0, ge=0.0, le=1.0)
+    # Optional alias requested by the hybrid VWAP/Bollinger strategy.
+    BOLLINGER_BW_MIN: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    BOLLINGER_REQUIRE_TOUCH: bool = False
+    VWAP_STRATEGY_ENABLED: bool = False
+    VWAP_LENGTH: int = Field(20, ge=2, le=500)
+    VWAP_STD: float = Field(2.0, gt=0.0, le=10.0)
+    VWAP_Z_THRESHOLD: float = Field(2.0, gt=0.0, le=10.0)
+    DYNAMIC_RSI_SHORT_ATR: int = Field(5, ge=2, le=200)
+    DYNAMIC_RSI_LONG_ATR: int = Field(20, ge=2, le=500)
+    ADX_LOW: float = Field(20.0, gt=0.0, le=100.0)
+    ADX_HIGH: float = Field(40.0, gt=0.0, le=100.0)
+    TIME_OF_DAY_FILTER_ENABLED: bool = True
+    TIME_OF_DAY_TRADE_START: str = "10:00"
+    TIME_OF_DAY_TRADE_END: str = "15:00"
     AGGRESSIVE_MODE: bool = False
-    AGGRESSIVE_RSI_BYPASS_THRESHOLD: float = Field(20.0, ge=1.0, le=99.0)
+    AGGRESSIVE_RSI_BYPASS_THRESHOLD: float = Field(20.0, ge=1.0, le=50.0)
+    SCALE_IN_ENABLED: bool = False
+    SCALE_IN_UNDERWATER_PCT: float = Field(-0.03, gt=-1.0, lt=0.0)
+    SCALE_IN_RSI_THRESHOLD: float = Field(25.0, ge=1.0, le=50.0)
+    SCALE_IN_ADD_QTY: float = Field(1.0, gt=0.0, le=10_000.0)
+    MAX_BULLETS_PER_SYMBOL: int = Field(2, ge=1, le=25)
     ATR_LENGTH: int = Field(14, ge=2, le=200)
     ATR_STOP_MULTIPLIER: float = Field(2.0, gt=0.0, le=20.0)
     ATR_PROFIT_MULTIPLIER: float = Field(3.0, gt=0.0, le=50.0)
@@ -88,6 +117,8 @@ class Settings(BaseSettings):
     # ---- Regime & synthetic trailing-profit (Phase Two) ----------------------------
     ADX_LENGTH: int = Field(14, ge=2, le=500)
     ADX_RANGE_MAX: float = Field(25.0, gt=0.0, le=100.0)
+    # Optional alias. When set, this overrides ADX_RANGE_MAX.
+    ADX_THRESHOLD: Optional[float] = Field(default=None, ge=1.0, le=100.0)
     SMA_FILTER_LENGTH: int = Field(200, ge=10, le=5000)
     SMA_SLOPE_LOOKBACK_BARS: int = Field(5, ge=1, le=500)
 
@@ -140,6 +171,31 @@ class Settings(BaseSettings):
     ORDER_TIMEOUT_SECONDS: float = Field(30.0, gt=0.0, le=3600.0)
     EMERGENCY_AGGRESSIVENESS_PCT: float = Field(0.0015, gt=0.0, le=0.05)
 
+    # ---- Midpoint limit peg (IEX / limit-at-mid + timeout chase) -----------------
+    MIDPOINT_PEG_ENABLED: bool = False
+    MIDPOINT_PEG_TIMEOUT_SECONDS: float = Field(30.0, gt=0.5, le=600.0)
+    MIDPOINT_PEG_MAX_CYCLES: int = Field(5, ge=1, le=50)
+    MIDPOINT_PEG_TAG: str = "midpoint_peg"
+
+    # ---- Global QQQ / macro regime (hourly bars) --------------------------------
+    QQQ_REGIME_ENABLED: bool = True
+    REGIME_QQQ_SYMBOL: str = "QQQ"
+    REGIME_ATR_RATIO_THRESHOLD: float = Field(1.2, gt=0.0, le=10.0)
+    REGIME_USE_SMA50: bool = True
+    REGIME_MAX_EQUITY_REDUCTION: float = Field(0.5, ge=0.0, le=1.0)
+    REGIME_BEAR_VOLATILE_BLOCK_ENTRIES: bool = False
+    REGIME_ATR_LENGTH: int = Field(14, ge=2, le=200)
+    REGIME_ATR_MA_LENGTH: int = Field(50, ge=5, le=500)
+
+    # ---- Orchestrator: ATR trail + bar-count time exit (5m bars) -----------------
+    EXEC_ATR_TRAIL_ENABLED: bool = True
+    ATR_TRAIL_MULTIPLIER: float = Field(2.0, gt=0.0, le=20.0)
+    MAX_POSITION_BARS: int = Field(12, ge=1, le=10_000)
+
+    # ---- Strategy liquidity gate (5m volume vs 20-bar average) ------------------
+    LIQUIDITY_GATE_ENABLED: bool = True
+    LIQUIDITY_THRESHOLD: float = Field(0.5, gt=0.0, le=1.0)
+
     # ---- Retries -------------------------------------------------------------------
     RETRY_MAX_ATTEMPTS: int = Field(5, ge=1, le=20)
     RETRY_BASE_DELAY_SECONDS: float = Field(0.5, gt=0.0, le=60.0)
@@ -156,8 +212,12 @@ class Settings(BaseSettings):
     # ---- Optional features ---------------------------------------------------------
     ENABLE_FRACTIONAL: bool = False
     # Optional alias. When set, this overrides ENABLE_FRACTIONAL.
+    ALLOW_FRACTIONAL: Optional[bool] = None
+    # Optional alias. When set, this overrides ENABLE_FRACTIONAL.
     FRACTIONAL_TRADING_ENABLED: Optional[bool] = None
+    FRACTIONAL_MIN_QTY: float = Field(0.001, gt=0.0, le=1.0)
     MIN_SHARES: float = Field(1.0, gt=0.0, le=100.0)
+    MIN_ORDER_DOLLARS: float = Field(10.0, ge=0.0)
 
     # ---- Live canary check (one-time per day, before main loop) --------------------
     # The canary verifies credentials, order submission, fills, reconciliation,
@@ -356,6 +416,36 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("ADX_THRESHOLD", mode="before")
+    @classmethod
+    def _coerce_empty_adx_threshold(cls, value: object) -> object:
+        if value in {"", None}:
+            return None
+        return value
+
+    @field_validator("BOLLINGER_BW_MIN", mode="before")
+    @classmethod
+    def _coerce_empty_bollinger_bw_min(cls, value: object) -> object:
+        if value in {"", None}:
+            return None
+        return value
+
+    @field_validator("TIME_OF_DAY_TRADE_START", "TIME_OF_DAY_TRADE_END")
+    @classmethod
+    def _validate_hhmm_time(cls, value: str) -> str:
+        raw = (value or "").strip()
+        parts = raw.split(":")
+        if len(parts) != 2:
+            raise ValueError("time-of-day values must use HH:MM format")
+        try:
+            hour = int(parts[0])
+            minute = int(parts[1])
+        except ValueError as exc:
+            raise ValueError("time-of-day values must use HH:MM format") from exc
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError("time-of-day HH:MM must be within 00:00..23:59")
+        return f"{hour:02d}:{minute:02d}"
+
     @field_validator("SECTOR_MAP_JSON")
     @classmethod
     def _validate_sector_map_json(cls, value: str) -> str:
@@ -412,8 +502,14 @@ class Settings(BaseSettings):
     def _validate_consistency(self) -> "Settings":
         if self.MAX_DOLLARS_PER_TRADE > 0:
             self.MAX_EQUITY_USAGE_USD = float(self.MAX_DOLLARS_PER_TRADE)
+        if self.ALLOW_FRACTIONAL is not None:
+            self.ENABLE_FRACTIONAL = bool(self.ALLOW_FRACTIONAL)
         if self.FRACTIONAL_TRADING_ENABLED is not None:
             self.ENABLE_FRACTIONAL = bool(self.FRACTIONAL_TRADING_ENABLED)
+        if self.BOLLINGER_BW_MIN is not None:
+            self.BOLLINGER_MIN_WIDTH_PCT = float(self.BOLLINGER_BW_MIN)
+        if self.ADX_THRESHOLD is not None:
+            self.ADX_RANGE_MAX = float(self.ADX_THRESHOLD)
         # Live trading requires explicit confirmation phrase.
         if (
             self.ALPACA_ENV == ALPACA_ENV_LIVE
@@ -436,6 +532,22 @@ class Settings(BaseSettings):
             raise ValueError("HIGH_VOL_RSI_ENTRY must be strictly less than RSI_EXIT.")
         if self.AGGRESSIVE_RSI_BYPASS_THRESHOLD >= self.RSI_EXIT:
             raise ValueError("AGGRESSIVE_RSI_BYPASS_THRESHOLD must be < RSI_EXIT.")
+        if self.DYNAMIC_RSI_MIN > self.DYNAMIC_RSI_MAX:
+            raise ValueError("DYNAMIC_RSI_MIN must be <= DYNAMIC_RSI_MAX.")
+        if not (self.DYNAMIC_RSI_MIN <= self.DYNAMIC_RSI_BASE <= self.DYNAMIC_RSI_MAX):
+            raise ValueError("DYNAMIC_RSI_BASE must be inside [DYNAMIC_RSI_MIN, DYNAMIC_RSI_MAX].")
+        if self.DYNAMIC_RSI_SHORT_ATR > self.DYNAMIC_RSI_LONG_ATR:
+            raise ValueError("DYNAMIC_RSI_SHORT_ATR must be <= DYNAMIC_RSI_LONG_ATR.")
+        if self.ADX_LOW >= self.ADX_HIGH:
+            raise ValueError("ADX_LOW must be strictly less than ADX_HIGH.")
+        if self.SCALE_IN_UNDERWATER_PCT >= 0:
+            raise ValueError("SCALE_IN_UNDERWATER_PCT must be negative.")
+        if not (1.0 <= self.SCALE_IN_RSI_THRESHOLD <= 50.0):
+            raise ValueError("SCALE_IN_RSI_THRESHOLD must be between 1 and 50.")
+        if self.SCALE_IN_ADD_QTY <= 0:
+            raise ValueError("SCALE_IN_ADD_QTY must be > 0.")
+        if self.MAX_BULLETS_PER_SYMBOL < 1:
+            raise ValueError("MAX_BULLETS_PER_SYMBOL must be >= 1.")
         # Retry bounds
         if self.RETRY_BASE_DELAY_SECONDS > self.RETRY_MAX_DELAY_SECONDS:
             raise ValueError(
