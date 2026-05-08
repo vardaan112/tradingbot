@@ -153,6 +153,7 @@ class Orchestrator:
         )
         self._last_positions_snapshot: list[PositionSnapshot] = []
         self._entry_audit: dict[str, dict[str, Any]] = {}
+        self._finalized_symbols: set[str] = set()
         self._last_report_date_et: str | None = None
         self._tick_anti_mart: tuple[RiskMode, float, str] = (RiskMode.NORMAL, 1.0, "")
         self._stop = asyncio.Event()
@@ -1121,9 +1122,28 @@ class Orchestrator:
     def _finalize_closed_trade(self, sym: str, prev_pos: PositionSnapshot) -> None:
         try:
             exit_px: float | None = None
-            qq = self._quote_cache.get(sym) if self._quote_cache else None
-            if qq is not None and qq.bid > 0 and qq.ask > qq.bid:
-                exit_px = (qq.bid + qq.ask) / 2.0
+            exit_px_source = "unknown"
+            ef = (
+                self._order_service.consume_last_exit_fill(sym)
+                if self._order_service is not None
+                else None
+            )
+            if ef is not None and ef.avg_fill_price > 0:
+                exit_px = float(ef.avg_fill_price)
+                exit_px_source = "broker_fill"
+                expected_qty = abs(float(prev_pos.qty))
+                mismatch = abs(ef.filled_qty - expected_qty) / max(expected_qty, 1e-9)
+                if mismatch > 0.05:
+                    self._log.warning(
+                        "event=exit_fill_qty_mismatch symbol=%s ef_qty=%.4f pos_qty=%.4f "
+                        "mismatch_pct=%.1f exit_price_source=broker_fill",
+                        sym, ef.filled_qty, expected_qty, mismatch * 100,
+                    )
+            else:
+                qq = self._quote_cache.get(sym) if self._quote_cache else None
+                if qq is not None and qq.bid > 0 and qq.ask > qq.bid:
+                    exit_px = (qq.bid + qq.ask) / 2.0
+                    exit_px_source = "quote_mid_fallback"
             audit = self._entry_audit.pop(sym, {})
             entry_px = audit.get("entry_price")
             if entry_px is None:
@@ -1143,6 +1163,7 @@ class Orchestrator:
                 "sentiment_label",
             }
             extra_meta = {k: v for k, v in audit.items() if k not in meta_reserve}
+            extra_meta["exit_price_source"] = exit_px_source
             self._database.record_completed_trade(
                 trade_id=None,
                 symbol=sym,
@@ -1183,6 +1204,13 @@ class Orchestrator:
             p_now = curr_map.get(sym)
             q_now = abs(float(p_now.qty)) if p_now is not None else 0.0
             if q_now < 0.99:
+                if sym in self._finalized_symbols:
+                    self._log.debug(
+                        "event=closure_dedup_skipped symbol=%s reason=already_finalized_this_session",
+                        sym,
+                    )
+                    continue
+                self._finalized_symbols.add(sym)
                 self._finalize_closed_trade(sym, p_prev)
 
         self._last_positions_snapshot = curr
@@ -1692,6 +1720,7 @@ class Orchestrator:
             }
             audit = {k: v for k, v in audit.items() if v is not None}
             self._entry_audit[sym_u] = audit
+            self._finalized_symbols.discard(sym_u)
             try:
                 wo: WorkingOrder | None
                 if self._settings.MIDPOINT_PEG_ENABLED:

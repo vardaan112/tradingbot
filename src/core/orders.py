@@ -73,6 +73,18 @@ class WorkingOrder:
         return self.status.lower() in terminal
 
 
+@dataclass(frozen=True)
+class ExitFill:
+    """Snapshot of the most recent terminal sell fill for a symbol."""
+
+    symbol: str
+    side: str
+    filled_qty: float
+    avg_fill_price: float
+    filled_at: datetime
+    client_order_id: str
+
+
 class OrderService:
     """Submits, cancels, and reconciles orders. Owns per-symbol working state."""
 
@@ -99,6 +111,7 @@ class OrderService:
         self._lock = threading.RLock()
         self._working: dict[str, WorkingOrder] = {}  # by client_order_id
         self._by_symbol: dict[str, str] = {}  # symbol -> client_order_id
+        self._last_exit_fill: dict[str, ExitFill] = {}  # symbol -> latest sell fill
 
     # ------------------------------------------------------------------ utils
 
@@ -135,6 +148,17 @@ class OrderService:
     def working_orders_snapshot(self) -> list[WorkingOrder]:
         with self._lock:
             return [w for w in self._working.values() if not w.is_terminal()]
+
+    def consume_last_exit_fill(self, symbol: str) -> Optional[ExitFill]:
+        """Pop and return the most recent terminal sell fill for ``symbol``.
+
+        Returns ``None`` if no such fill is cached. Callers (e.g. the
+        orchestrator's closed-trade finalizer) use this to record realized
+        PnL from the broker-confirmed price instead of a quote midpoint.
+        """
+
+        with self._lock:
+            return self._last_exit_fill.pop(symbol.upper(), None)
 
     def _notify_simulated_fill(
         self,
@@ -898,9 +922,15 @@ class OrderService:
             wo.broker_order_id = str(broker_id)
             wo.status = str(getattr(existing, "status", "accepted"))
             wo.last_event_at = datetime.now(timezone.utc)
+            fq = float(getattr(existing, "filled_qty", 0) or 0)
+            fa = float(getattr(existing, "filled_avg_price", 0) or 0)
+            if fq > wo.filled_qty:
+                wo.filled_qty = fq
+            if fa > 0 and wo.avg_fill_price == 0:
+                wo.avg_fill_price = fa
             self._log.info(
-                "Reconciled coid=%s already accepted as broker_id=%s status=%s",
-                wo.client_order_id, wo.broker_order_id, wo.status,
+                "Reconciled coid=%s already accepted as broker_id=%s status=%s filled_qty=%.4f avg_fill=%.4f",
+                wo.client_order_id, wo.broker_order_id, wo.status, wo.filled_qty, wo.avg_fill_price,
                 extra={"symbol": wo.symbol, "client_order_id": wo.client_order_id},
             )
             self._persist_index()
@@ -927,7 +957,12 @@ class OrderService:
         quote: Quote,
         spread_fraction: float = 0.25,
     ) -> Optional[WorkingOrder]:
-        """Mirror of submit_limit_entry intended for normal (non-emergency) exits."""
+        """Mirror of submit_limit_entry intended for normal (non-emergency) exits.
+
+        Uses TimeInForce.DAY intentionally — soft exits (TP, RSI, trailing profit,
+        time exit) benefit from resting in the queue for the session.  Stop-breach
+        hard exits use ``submit_emergency_flatten`` (TimeInForce.IOC) instead.
+        """
         return self.submit_limit_entry(
             symbol, qty, side, quote=quote, spread_fraction=spread_fraction
         )
@@ -941,7 +976,12 @@ class OrderService:
         quote: Quote,
         aggressiveness_pct: float,
     ) -> Optional[WorkingOrder]:
-        """Marketable limit IOC for emergency flatten / stop breach."""
+        """Marketable limit IOC for emergency flatten / stop breach.
+
+        Uses TimeInForce.IOC — must fill immediately or cancel.  Called for
+        ATR-stop breaches (EMERGENCY_EXIT_LONG signals) and kill-switch flattens.
+        Normal soft exits use ``submit_limit_exit`` (DAY) instead.
+        """
         symbol = symbol.upper()
         side_l = side.lower()
         qty = float(qty)
@@ -1129,6 +1169,21 @@ class OrderService:
             wo_side_raw = wo.side or str(getattr(order, "side", "") or "").lower()
             wo_side = str(wo_side_raw).lower()
             terminal = wo.is_terminal()
+            if (
+                terminal
+                and wo_side == "sell"
+                and float(wo.filled_qty) > 0
+                and float(wo.avg_fill_price) > 0
+                and symbol
+            ):
+                self._last_exit_fill[symbol.upper()] = ExitFill(
+                    symbol=symbol.upper(),
+                    side="sell",
+                    filled_qty=float(wo.filled_qty),
+                    avg_fill_price=float(wo.avg_fill_price),
+                    filled_at=wo.last_event_at or datetime.now(timezone.utc),
+                    client_order_id=coid,
+                )
 
         self._log.info(
             "Trade update coid=%s symbol=%s side=%s status=%s filled=%.4f avg=%.4f",
@@ -1182,6 +1237,13 @@ class OrderService:
                     if broker_id is not None:
                         wo.broker_order_id = str(broker_id)
                 wo.status = str(getattr(o, "status", "open"))
+                # Sync partial-fill state missed during WS reconnect gaps.
+                fq = float(getattr(o, "filled_qty", 0) or 0)
+                fa = float(getattr(o, "filled_avg_price", 0) or 0)
+                if fq > wo.filled_qty:
+                    wo.filled_qty = fq
+                if fa > 0 and wo.avg_fill_price == 0:
+                    wo.avg_fill_price = fa
                 if symbol:
                     self._by_symbol[symbol] = coid
 
