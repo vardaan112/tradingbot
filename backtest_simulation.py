@@ -81,6 +81,12 @@ class PendingLimit:
     reason: str
     kind: Literal["entry", "exit", "emergency"]
 
+    def __post_init__(self) -> None:
+        if self.submitted_ts.tzinfo is None:
+            raise ValueError(
+                f"PendingLimit.submitted_ts must be tz-aware; got naive datetime for {self.symbol}"
+            )
+
 
 @dataclass
 class SimLot:
@@ -404,6 +410,11 @@ def process_pending_orders(
 
     next_pending: list[PendingLimit] = []
     for po in pending:
+        if po.submitted_ts >= ts:
+            # Same-bar fill would peek at OHLC of the bar that produced the
+            # signal — only fill from the next bar onward.
+            next_pending.append(po)
+            continue
         row = rowslice.get(po.symbol.upper())
         if row is None:
             po.bars_alive += 1
