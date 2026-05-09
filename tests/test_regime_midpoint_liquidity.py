@@ -31,6 +31,32 @@ def test_bear_volatile_when_below_sma_and_high_atr_ratio() -> None:
     assert snap.bear_volatile is True
 
 
+def test_regime_insufficient_bars_fail_closed_by_default() -> None:
+    idx = pd.date_range("2026-01-01", periods=10, freq="1h", tz="UTC")
+    close = pd.Series([100.0] * len(idx), index=idx)
+    df = pd.DataFrame({"open": close, "high": close + 1.0, "low": close - 1.0, "close": close}, index=idx)
+
+    snap = _compute_snapshot(df, make_settings(), sym="QQQ")
+
+    assert snap.error == "insufficient_bars"
+    assert snap.bear_volatile is True
+
+
+def test_regime_unknown_reduce_size_does_not_hard_block() -> None:
+    idx = pd.date_range("2026-01-01", periods=10, freq="1h", tz="UTC")
+    close = pd.Series([100.0] * len(idx), index=idx)
+    df = pd.DataFrame({"open": close, "high": close + 1.0, "low": close - 1.0, "close": close}, index=idx)
+
+    snap = _compute_snapshot(
+        df,
+        make_settings(REGIME_UNKNOWN_ACTION="reduce_size"),
+        sym="QQQ",
+    )
+
+    assert snap.error == "insufficient_bars"
+    assert snap.bear_volatile is False
+
+
 def test_regime_mult_reduces_usd_cap() -> None:
     s = make_settings(BOT_CAPITAL_BASE_USD=25_000.0)
     sz = PositionSizer(s, ComplianceAdapter(s), ExposureChecker(s))

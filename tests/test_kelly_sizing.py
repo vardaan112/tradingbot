@@ -81,8 +81,8 @@ def test_sizer_handles_zero_avg_loss_via_db_stub(make_settings_factory) -> None:
     settings = make_settings_factory(ENABLE_KELLY_SIZING=True, KELLY_MIN_TRADES=5, KELLY_LOOKBACK_TRADES=20)
 
     mock_db = MagicMock()
-    mock_db.get_recent_realized_pnls_for_kelly = lambda **_k: [10.0, 20.0, 15.0, 50.0, 44.0]
-    assert len(mock_db.get_recent_realized_pnls_for_kelly(limit=20)) >= 5
+    mock_db.get_recent_realized_returns_for_kelly = lambda **_k: [0.01, 0.02, 0.015, 0.05, 0.044]
+    assert len(mock_db.get_recent_realized_returns_for_kelly(limit=20)) >= 5
 
     sizer = PositionSizer(settings, ComplianceAdapter(settings), ExposureChecker(settings), database=mock_db)
     acc = make_account(equity=50_000.0)

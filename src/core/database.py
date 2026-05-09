@@ -41,6 +41,13 @@ class CompletedTradeRow:
     sentiment_label: Optional[str]
     is_canary: int
     source: Optional[str] = None
+    realized_return_pct: Optional[float] = None
+    entry_notional: Optional[float] = None
+    exit_notional: Optional[float] = None
+    entry_fill_source: Optional[str] = None
+    exit_fill_source: Optional[str] = None
+    invalid_for_ml: int = 0
+    invalid_for_kelly: int = 0
 
 
 class Database:
@@ -101,6 +108,14 @@ class Database:
                       sentiment_score REAL,
                       sentiment_label TEXT,
                       is_canary INTEGER DEFAULT 0,
+                      realized_return_pct REAL,
+                      entry_notional REAL,
+                      exit_notional REAL,
+                      entry_fill_source TEXT,
+                      exit_fill_source TEXT,
+                      data_quality_flags_json TEXT,
+                      invalid_for_ml INTEGER DEFAULT 0,
+                      invalid_for_kelly INTEGER DEFAULT 0,
                       metadata_json TEXT
                     );
 
@@ -170,6 +185,14 @@ class Database:
             ("completed_trades", "inserted_at", "TEXT"),
             ("completed_trades", "original_entry_time", "TEXT"),
             ("completed_trades", "original_exit_time", "TEXT"),
+            ("completed_trades", "realized_return_pct", "REAL"),
+            ("completed_trades", "entry_notional", "REAL"),
+            ("completed_trades", "exit_notional", "REAL"),
+            ("completed_trades", "entry_fill_source", "TEXT"),
+            ("completed_trades", "exit_fill_source", "TEXT"),
+            ("completed_trades", "data_quality_flags_json", "TEXT"),
+            ("completed_trades", "invalid_for_ml", "INTEGER DEFAULT 0"),
+            ("completed_trades", "invalid_for_kelly", "INTEGER DEFAULT 0"),
             ("execution_events", "source", "TEXT DEFAULT 'live'"),
             ("execution_events", "replay_run_id", "TEXT"),
             ("execution_events", "simulated_timestamp", "TEXT"),
@@ -228,8 +251,28 @@ class Database:
         inserted_at: Optional[str] = None,
         original_entry_time: Optional[str] = None,
         original_exit_time: Optional[str] = None,
+        realized_return_pct: Optional[float] = None,
+        entry_notional: Optional[float] = None,
+        exit_notional: Optional[float] = None,
+        entry_fill_source: Optional[str] = None,
+        exit_fill_source: Optional[str] = None,
+        data_quality_flags: Optional[dict[str, Any]] = None,
+        invalid_for_ml: bool = False,
+        invalid_for_kelly: bool = False,
     ) -> Optional[int]:
-        meta = json.dumps(metadata) if metadata else None
+        md = dict(metadata or {})
+        flags = dict(data_quality_flags or {})
+        if isinstance(md.get("data_quality_flags"), dict):
+            flags.update(md.get("data_quality_flags") or {})
+        invalid_for_ml = bool(invalid_for_ml or md.get("invalid_for_ml") is True)
+        invalid_for_kelly = bool(invalid_for_kelly or md.get("invalid_for_kelly") is True)
+        realized_return_pct = realized_return if realized_return_pct is None else realized_return_pct
+        if entry_notional is None and entry_price is not None:
+            entry_notional = abs(float(quantity) * float(entry_price))
+        if exit_notional is None and exit_price is not None:
+            exit_notional = abs(float(quantity) * float(exit_price))
+        flags_json = json.dumps(flags, sort_keys=True) if flags else None
+        meta = json.dumps(md, sort_keys=True) if md else None
         ins_ts = inserted_at or datetime.now(timezone.utc).isoformat()
         oet = original_entry_time or opened_at
         oxt = original_exit_time or closed_at
@@ -239,8 +282,11 @@ class Database:
           realized_pnl, realized_return, opened_at, closed_at,
           strategy_name, risk_mode, regime_type, sentiment_score,
           sentiment_label, is_canary, metadata_json,
-          source, replay_run_id, inserted_at, original_entry_time, original_exit_time
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          source, replay_run_id, inserted_at, original_entry_time, original_exit_time,
+          realized_return_pct, entry_notional, exit_notional,
+          entry_fill_source, exit_fill_source, data_quality_flags_json,
+          invalid_for_ml, invalid_for_kelly
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """
         args = (
             trade_id,
@@ -265,6 +311,14 @@ class Database:
             ins_ts,
             oet,
             oxt,
+            realized_return_pct,
+            entry_notional,
+            exit_notional,
+            entry_fill_source,
+            exit_fill_source,
+            flags_json,
+            1 if invalid_for_ml else 0,
+            1 if invalid_for_kelly else 0,
         )
         with self._lock:
             try:
@@ -381,6 +435,7 @@ class Database:
         SELECT realized_pnl FROM completed_trades
         WHERE COALESCE(is_canary, 0) = 0
           AND realized_pnl IS NOT NULL
+          AND COALESCE(invalid_for_kelly, 0) = 0
           {sim_clause}
         ORDER BY datetime(closed_at) DESC
         LIMIT ?
@@ -405,6 +460,83 @@ class Database:
                 continue
         return out
 
+    def get_recent_realized_returns_for_kelly(
+        self,
+        *,
+        limit: int,
+        exclude_simulation: bool = True,
+        exclude_canary: bool = True,
+        exclude_degraded: bool = True,
+    ) -> list[float]:
+        """Return normalized per-trade returns for Kelly.
+
+        Raw dollar P&L is not comparable across varying position notionals. This
+        method uses stored return fields first, then falls back to
+        realized_pnl / entry_notional when that label is complete.
+        """
+
+        if limit < 1:
+            return []
+        sim_clause = " AND COALESCE(source,'live') NOT IN ('simulation') " if exclude_simulation else ""
+        canary_clause = " AND COALESCE(is_canary, 0) = 0 " if exclude_canary else ""
+        degraded_clause = " AND COALESCE(invalid_for_kelly, 0) = 0 " if exclude_degraded else ""
+        sql = f"""
+        SELECT realized_return_pct, realized_return, realized_pnl, entry_notional,
+               COALESCE(metadata_json,'') AS metadata_json,
+               COALESCE(data_quality_flags_json,'') AS data_quality_flags_json,
+               COALESCE(entry_fill_source,'') AS entry_fill_source,
+               COALESCE(exit_fill_source,'') AS exit_fill_source
+        FROM completed_trades
+        WHERE (
+            realized_return_pct IS NOT NULL
+            OR realized_return IS NOT NULL
+            OR (realized_pnl IS NOT NULL AND entry_notional IS NOT NULL AND entry_notional > 0)
+        )
+        {canary_clause}
+        {sim_clause}
+        {degraded_clause}
+        ORDER BY datetime(closed_at) DESC
+        LIMIT ?
+        """
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    rows = conn.execute(sql, (limit,)).fetchall()
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_write_error kind=kelly_returns error=%s", exc)
+                return []
+
+        out: list[float] = []
+        for r in rows:
+            if exclude_degraded:
+                try:
+                    md = json.loads(str(r["metadata_json"] or "{}"))
+                    flags = json.loads(str(r["data_quality_flags_json"] or "{}"))
+                except json.JSONDecodeError:
+                    md = {}
+                    flags = {}
+                if isinstance(md, dict) and (md.get("invalid_for_kelly") or md.get("invalid_for_ml")):
+                    continue
+                if isinstance(flags, dict) and flags:
+                    continue
+                if str(r["exit_fill_source"] or "").lower() in {"quote_mid_fallback", "degraded_fallback"}:
+                    continue
+            try:
+                raw = r["realized_return_pct"]
+                if raw is None:
+                    raw = r["realized_return"]
+                if raw is None and r["entry_notional"] not in {None, 0}:
+                    raw = float(r["realized_pnl"]) / float(r["entry_notional"])
+                v = float(raw)
+                if math.isfinite(v):
+                    out.append(v)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+        return out
+
     def get_ml_training_rows(
         self,
         *,
@@ -421,6 +553,7 @@ class Database:
         FROM completed_trades
         WHERE COALESCE(is_canary, 0) = 0
           AND realized_pnl IS NOT NULL
+          AND COALESCE(invalid_for_ml, 0) = 0
           {sim_clause}
         ORDER BY datetime(closed_at) DESC
         LIMIT ?

@@ -403,8 +403,18 @@ class Orchestrator:
             symbols_csv,
         )
 
-        with contextlib.suppress(Exception):
+        try:
             self._database.init_schema()
+        except Exception as exc:  # noqa: BLE001
+            self._log.exception("event=schema_migration_failed component=database err=%s", exc)
+            enqueue_discord_alert(
+                self._discord_out,
+                {
+                    "title": "DATABASE_INIT_FAILED",
+                    "lines": ["Database schema initialization failed.", "See logs: event=schema_migration_failed"],
+                    "color": 0xE74C3C,
+                },
+            )
 
         self._clients = build_alpaca_clients(self._settings)
         feed = self._clients.resolved_feed
@@ -1122,7 +1132,7 @@ class Orchestrator:
         ):
             if self._phase8_autotune_last_et_week != week_key:
                 self._phase8_autotune_last_et_week = week_key
-                asyncio.create_task(tune())
+                self._track_background_task(tune(), name="weekly_autotune")
 
         if self._settings.ENABLE_ML_FILTER and self._ml_filter is not None:
             if self._phase8_ml_last_et_day != day_key and et.hour >= 16 and not getattr(
@@ -1133,7 +1143,31 @@ class Orchestrator:
                 async def retr() -> None:
                     await asyncio.to_thread(self._ml_filter.train_from_database, self._database)
 
-                asyncio.create_task(retr())
+                self._track_background_task(retr(), name="daily_ml_retrain")
+
+    def _track_background_task(self, coro: Any, *, name: str) -> asyncio.Task:
+        """Create a task and log any exception instead of losing it silently."""
+
+        task = asyncio.create_task(coro, name=name)
+
+        def _done(t: asyncio.Task) -> None:
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._log.exception("event=async_task_failed task=%s err=%s", name, exc)
+                enqueue_discord_alert(
+                    self._discord_out,
+                    {
+                        "title": "ASYNC_TASK_FAILED",
+                        "lines": [f"task={name}", "See logs: event=async_task_failed"],
+                        "color": 0xE74C3C,
+                    },
+                )
+
+        task.add_done_callback(_done)
+        return task
 
     def _finalize_closed_trade(self, sym: str, prev_pos: PositionSnapshot) -> None:
         try:
@@ -1161,11 +1195,12 @@ class Orchestrator:
                     exit_px = (qq.bid + qq.ask) / 2.0
                     exit_px_source = "quote_mid_fallback"
             audit = self._entry_audit.pop(sym, {})
-            entry_px = audit.get("entry_price")
-            if entry_px is None:
+            # Closed-trade labels must be anchored to broker/ledger fill data,
+            # not the quote used when the entry signal was created.
+            entry_px_source = str(audit.get("entry_fill_source") or "position_snapshot_avg")
+            entry_px = audit.get("entry_filled_avg_price")
+            if entry_px is None or float(entry_px) <= 0:
                 entry_px = float(prev_pos.avg_entry_price)
-            else:
-                entry_px = float(entry_px)
             qty = abs(float(prev_pos.qty))
             pnl = (exit_px - entry_px) * qty if exit_px is not None else None
             ret = ((exit_px / entry_px) - 1.0) if exit_px and entry_px > 0 else None
@@ -1180,6 +1215,13 @@ class Orchestrator:
             }
             extra_meta = {k: v for k, v in audit.items() if k not in meta_reserve}
             extra_meta["exit_price_source"] = exit_px_source
+            extra_meta["entry_price_source"] = entry_px_source
+            invalid_label = bool(exit_px_source != "broker_fill" or exit_px is None)
+            data_quality_flags = {}
+            if invalid_label:
+                data_quality_flags["degraded_exit_label"] = exit_px_source
+                extra_meta["invalid_for_ml"] = True
+                extra_meta["invalid_for_kelly"] = True
             self._database.record_completed_trade(
                 trade_id=None,
                 symbol=sym,
@@ -1198,6 +1240,14 @@ class Orchestrator:
                 sentiment_label=audit.get("sentiment_label"),
                 is_canary=0,
                 metadata=extra_meta or None,
+                realized_return_pct=ret,
+                entry_notional=entry_px * qty if entry_px is not None else None,
+                exit_notional=exit_px * qty if exit_px is not None else None,
+                entry_fill_source=entry_px_source,
+                exit_fill_source=exit_px_source,
+                data_quality_flags=data_quality_flags or None,
+                invalid_for_ml=invalid_label,
+                invalid_for_kelly=invalid_label,
             )
         except Exception as exc:  # noqa: BLE001
             self._log.warning(
@@ -1488,28 +1538,44 @@ class Orchestrator:
             regime_mult = 1.0
             if self._regime_detector is not None:
                 rs = self._regime_detector.snapshot
-                if rs.bear_volatile:
-                    if bool(self._settings.REGIME_BEAR_VOLATILE_BLOCK_ENTRIES):
+                regime_unknown = bool(
+                    rs.error in {"init_pending", "insufficient_bars", "stale_regime_data"}
+                    or (not rs.anchor_symbol and str(rs.anchor_state).lower() == "unknown")
+                )
+                block_for_regime = bool(
+                    (regime_unknown and self._settings.REGIME_UNKNOWN_ACTION == "block_entries")
+                    or (rs.bear_volatile and self._settings.REGIME_BEAR_VOLATILE_BLOCK_ENTRIES)
+                )
+                if rs.bear_volatile or regime_unknown:
+                    if block_for_regime:
+                        msg = (
+                            "Regime_unknown_blocks_entry"
+                            if regime_unknown
+                            else "QQQ_BearVolatile_macro_gate_blocks_entry"
+                        )
                         if is_scale_in:
                             _scale_in_skip(
                                 skip_code="scale_in_macro_regime",
-                                reason="QQQ_BearVolatile_block_entries",
+                                reason=msg,
                                 public_code=SkipCodes.SKIP_MARKET_REGIME,
                                 extra_meta={
                                     "QQQ_ATR_ratio": rs.atr_ratio,
                                     "QQQ_close": rs.close,
+                                    "regime_error": rs.error,
                                 },
                             )
                         else:
                             self._emit_orchestrator_enter_skip(
                                 SkipReason(
                                     code=SkipCodes.SKIP_MARKET_REGIME,
-                                    message="QQQ_BearVolatile_macro_gate_blocks_entry",
+                                    message=msg,
                                     symbol=sym,
                                     metadata={
                                         "QQQ_ATR_ratio": rs.atr_ratio,
                                         "QQQ_close": rs.close,
                                         "QQQ_sma50": rs.sma50,
+                                        "regime_error": rs.error,
+                                        "regime_unknown_action": self._settings.REGIME_UNKNOWN_ACTION,
                                         "sector": sector,
                                     },
                                 ),
@@ -1802,6 +1868,17 @@ class Orchestrator:
                 )
                 self._log.error("Entry placement error %s: %s", sym, exc, extra=coid_extra)
                 return
+            if wo is not None:
+                audit["entry_client_order_id"] = wo.client_order_id
+                audit["entry_order_id"] = wo.broker_order_id
+                audit["entry_limit_price"] = wo.limit_price
+                audit["entry_fill_source"] = (
+                    "dry_run_fill" if str(wo.status).lower() == "dry_run" else "position_snapshot_avg"
+                )
+                if float(wo.avg_fill_price or 0.0) > 0:
+                    audit["entry_filled_avg_price"] = float(wo.avg_fill_price)
+                    audit["entry_fill_source"] = "broker_fill"
+                self._entry_audit[sym_u] = audit
             if wo is None:
                 self._entry_audit.pop(sym_u, None)
                 if self._settings.MIDPOINT_PEG_ENABLED:

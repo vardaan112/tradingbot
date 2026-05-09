@@ -67,6 +67,94 @@ def test_limit_buy_fills_only_when_low_touches() -> None:
     assert not pend
 
 
+def test_pending_order_does_not_fill_on_signal_bar() -> None:
+    book = bts.SimulatedAccountBook(initial_equity=50_000.0, commission_bps=0.0)
+    signal_ts = datetime(2024, 1, 1, 14, 0, tzinfo=UTC)
+    pend: list[bts.PendingLimit] = [
+        bts.PendingLimit(
+            order_id="o1",
+            client_order_id="c1",
+            symbol="SPY",
+            side="buy",
+            qty=1,
+            limit_price=100.0,
+            submitted_ts=signal_ts,
+            bars_alive=0,
+            reason="test",
+            kind="entry",
+        ),
+    ]
+    rows: list[bts.SimulationOrderRecord] = []
+    bts.process_pending_orders(
+        pending=pend,
+        ts=signal_ts,
+        rowslice={"SPY": pd.Series({"high": 101.0, "low": 99.0, "close": 100.0})},
+        slippage_bps=0.0,
+        order_timeout_bars=5,
+        book=book,
+        order_rows=rows,
+        closed_trades=[],
+        discord=bts.MockDiscordSimulator(),
+        trade_counter=[1],
+    )
+
+    assert pend
+    assert rows == []
+    assert book.positions == {}
+
+
+def test_backtest_pnl_changes_only_after_next_bar() -> None:
+    book = bts.SimulatedAccountBook(initial_equity=50_000.0, commission_bps=0.0)
+    entry_ts = datetime(2024, 1, 1, 14, 0, tzinfo=UTC)
+    book.apply_buy(symbol="SPY", qty=1, px=100.0, ts=entry_ts, reason="in", trade_id=10)
+    pend: list[bts.PendingLimit] = [
+        bts.PendingLimit(
+            order_id="o2",
+            client_order_id="c2",
+            symbol="SPY",
+            side="sell",
+            qty=1,
+            limit_price=101.0,
+            submitted_ts=entry_ts,
+            bars_alive=0,
+            reason="out",
+            kind="exit",
+        ),
+    ]
+    rows: list[bts.SimulationOrderRecord] = []
+    closed: list[dict] = []
+
+    bts.process_pending_orders(
+        pending=pend,
+        ts=entry_ts,
+        rowslice={"SPY": pd.Series({"high": 102.0, "low": 99.0, "close": 101.0})},
+        slippage_bps=0.0,
+        order_timeout_bars=5,
+        book=book,
+        order_rows=rows,
+        closed_trades=closed,
+        discord=bts.MockDiscordSimulator(),
+        trade_counter=[10],
+    )
+    assert closed == []
+    assert book.realized_pnl == 0.0
+
+    bts.process_pending_orders(
+        pending=pend,
+        ts=datetime(2024, 1, 1, 14, 5, tzinfo=UTC),
+        rowslice={"SPY": pd.Series({"high": 101.0, "low": 99.5, "close": 100.5})},
+        slippage_bps=0.0,
+        order_timeout_bars=5,
+        book=book,
+        order_rows=rows,
+        closed_trades=closed,
+        discord=bts.MockDiscordSimulator(),
+        trade_counter=[10],
+    )
+    assert len(closed) == 1
+    assert book.realized_pnl == pytest.approx(1.0)
+
+
 def test_limit_buy_no_fill_when_above_low() -> None:
     book = bts.SimulatedAccountBook(initial_equity=50_000.0, commission_bps=0.0)
     pend = [

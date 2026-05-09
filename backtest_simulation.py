@@ -42,6 +42,13 @@ _LOG = logging.getLogger("backtest.sim")
 _BARS_PER_TRADING_YEAR = 252 * 78  # aligned with spec (5‑minute bars, regular session heuristic)
 
 
+def _log_backtest_event(event: str, **fields: Any) -> None:
+    """Emit grep-friendly structured audit events from the simulator."""
+
+    msg = " ".join(f"{k}={v}" for k, v in fields.items())
+    _LOG.info("event=%s %s", event, msg)
+
+
 class MockDiscordSimulator:
     """Console-only Discord stand-in."""
 
@@ -392,6 +399,15 @@ def process_pending_orders(
         return 1 if po.kind == "emergency" else int(order_timeout_bars)
 
     def record_cancel(po: PendingLimit, suffix: str) -> None:
+        _log_backtest_event(
+            "backtest_order_expired",
+            symbol=po.symbol.upper(),
+            side=po.side.lower(),
+            signal_bar_ts=po.submitted_ts.isoformat(),
+            execution_bar_ts=ts.isoformat(),
+            limit_price=f"{float(po.limit_price):.6f}",
+            reason=suffix,
+        )
         order_rows.append(
             SimulationOrderRecord(
                 order_id=po.order_id,
@@ -427,6 +443,17 @@ def process_pending_orders(
         high_px = float(row["high"])
         low_px = float(row["low"])
         sy = po.side.lower()
+        _log_backtest_event(
+            "backtest_order_fill_evaluated",
+            symbol=po.symbol.upper(),
+            side=sy,
+            signal_bar_ts=po.submitted_ts.isoformat(),
+            execution_bar_ts=ts.isoformat(),
+            limit_price=f"{float(po.limit_price):.6f}",
+            bar_low=f"{low_px:.6f}",
+            bar_high=f"{high_px:.6f}",
+            reason=po.reason,
+        )
 
         if sy == "buy" and low_px <= po.limit_price + 1e-12:
             fill_px = float(po.limit_price) + slip * abs(float(po.limit_price)) / 10_000.0
@@ -454,6 +481,18 @@ def process_pending_orders(
                     filled_avg_price=f"{fill_px:.6f}",
                     reason=po.reason,
                 ),
+            )
+            _log_backtest_event(
+                "backtest_order_filled",
+                symbol=po.symbol.upper(),
+                side="buy",
+                signal_bar_ts=po.submitted_ts.isoformat(),
+                execution_bar_ts=ts.isoformat(),
+                limit_price=f"{float(po.limit_price):.6f}",
+                bar_low=f"{low_px:.6f}",
+                bar_high=f"{high_px:.6f}",
+                fill_price=f"{fill_px:.6f}",
+                reason=po.reason,
             )
             discord.print_embed(
                 "Simulated BUY fill",
@@ -501,6 +540,18 @@ def process_pending_orders(
                     filled_avg_price=f"{fill_px:.6f}",
                     reason=po.reason,
                 ),
+            )
+            _log_backtest_event(
+                "backtest_order_filled",
+                symbol=po.symbol.upper(),
+                side="sell",
+                signal_bar_ts=po.submitted_ts.isoformat(),
+                execution_bar_ts=ts.isoformat(),
+                limit_price=f"{float(po.limit_price):.6f}",
+                bar_low=f"{low_px:.6f}",
+                bar_high=f"{high_px:.6f}",
+                fill_price=f"{fill_px:.6f}",
+                reason=po.reason,
             )
             discord.print_embed(
                 "Simulated SELL fill",
@@ -774,6 +825,14 @@ def run_backtest(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]
                     lim_px = limit_buy_px(q)
                     cid = generate_client_order_id(strategy.name, sym, "buy")
                     oid = f"sim-{uuid.uuid4().hex[:10]}"
+                    _log_backtest_event(
+                        "backtest_pending_order_created",
+                        symbol=sym.upper(),
+                        side="buy",
+                        signal_bar_ts=ts.isoformat(),
+                        limit_price=f"{float(lim_px):.6f}",
+                        reason=str(signal.reason)[:180],
+                    )
                     pending.append(
                         PendingLimit(
                             order_id=oid,
@@ -826,6 +885,14 @@ def run_backtest(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]
                     lim_px = limit_sell_px(q)
                     cid = generate_client_order_id(strategy.name, sym, "sell")
                     oid = f"sim-{uuid.uuid4().hex[:10]}"
+                    _log_backtest_event(
+                        "backtest_pending_order_created",
+                        symbol=sym.upper(),
+                        side="sell",
+                        signal_bar_ts=ts.isoformat(),
+                        limit_price=f"{float(lim_px):.6f}",
+                        reason=str(signal.reason)[:180],
+                    )
                     pending.append(
                         PendingLimit(
                             order_id=oid,
@@ -851,6 +918,14 @@ def run_backtest(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, Any]
                     lim_px = emergency_sell_px(q, settings.EMERGENCY_AGGRESSIVENESS_PCT)
                     cid = generate_client_order_id(strategy.name + "EMG", sym, "sell")
                     oid = f"sim-{uuid.uuid4().hex[:10]}"
+                    _log_backtest_event(
+                        "backtest_pending_order_created",
+                        symbol=sym.upper(),
+                        side="sell",
+                        signal_bar_ts=ts.isoformat(),
+                        limit_price=f"{float(lim_px):.6f}",
+                        reason=str(signal.reason)[:180],
+                    )
                     pending.append(
                         PendingLimit(
                             order_id=oid,

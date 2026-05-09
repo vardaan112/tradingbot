@@ -112,3 +112,75 @@ def test_execution_event_count(tmp_path: Path) -> None:
         trading_day_yyyy_mm_dd=day,
     )
     assert n == 1
+
+
+def test_kelly_returns_use_normalized_trade_return_and_exclude_bad_labels(tmp_path: Path) -> None:
+    db = Database(tmp_path / "kelly.sqlite3")
+    db.init_schema()
+    db.record_completed_trade(
+        trade_id="a",
+        symbol="SPY",
+        side="long",
+        quantity=1.0,
+        entry_price=100.0,
+        exit_price=110.0,
+        realized_pnl=10.0,
+        realized_return=0.10,
+        opened_at=None,
+        closed_at="2026-01-03T15:00:00+00:00",
+        strategy_name="rsi_meanrev",
+        risk_mode=None,
+        regime_type=None,
+        sentiment_score=None,
+        sentiment_label=None,
+        is_canary=0,
+        entry_fill_source="broker_fill",
+        exit_fill_source="broker_fill",
+    )
+    db.record_completed_trade(
+        trade_id="b",
+        symbol="QQQ",
+        side="long",
+        quantity=10.0,
+        entry_price=100.0,
+        exit_price=101.0,
+        realized_pnl=10.0,
+        realized_return=0.01,
+        opened_at=None,
+        closed_at="2026-01-03T15:01:00+00:00",
+        strategy_name="rsi_meanrev",
+        risk_mode=None,
+        regime_type=None,
+        sentiment_score=None,
+        sentiment_label=None,
+        is_canary=0,
+        entry_fill_source="broker_fill",
+        exit_fill_source="broker_fill",
+    )
+    db.record_completed_trade(
+        trade_id="bad",
+        symbol="IWM",
+        side="long",
+        quantity=1.0,
+        entry_price=100.0,
+        exit_price=99.0,
+        realized_pnl=-1.0,
+        realized_return=-0.01,
+        opened_at=None,
+        closed_at="2026-01-03T15:02:00+00:00",
+        strategy_name="rsi_meanrev",
+        risk_mode=None,
+        regime_type=None,
+        sentiment_score=None,
+        sentiment_label=None,
+        is_canary=0,
+        metadata={"invalid_for_kelly": True},
+        entry_fill_source="broker_fill",
+        exit_fill_source="quote_mid_fallback",
+        invalid_for_kelly=True,
+    )
+
+    returns = db.get_recent_realized_returns_for_kelly(limit=10)
+
+    assert returns == [0.01, 0.10]
+    assert db.get_recent_realized_pnls_for_kelly(limit=10) == [10.0, 10.0]

@@ -13,8 +13,8 @@ from config.settings import Settings
 from core.database import Database
 
 
-def _kelly_stats_from_pnls(pnls: list[float]) -> tuple[float, float, float, float, int]:
-    vals = [float(x) for x in pnls if math.isfinite(float(x))]
+def _kelly_stats_from_returns(returns: list[float]) -> tuple[float, float, float, float, int]:
+    vals = [float(x) for x in returns if math.isfinite(float(x))]
     n = len(vals)
     wins = [x for x in vals if x > 1e-9]
     losses = [x for x in vals if x < -1e-9]
@@ -51,7 +51,11 @@ def compute_kelly_risk_scaling(
     *,
     pnls_newest_first: Sequence[float],
 ) -> tuple[float, dict[str, float]]:
-    """Return multiplier in ``[KELLY_MIN_RISK_MULTIPLIER, KELLY_MAX_RISK_MULTIPLIER]`` around 1.0."""
+    """Return a risk multiplier from normalized trade returns.
+
+    The legacy argument name is kept for API compatibility with existing tests;
+    callers should pass realized_return_pct values, not raw dollar P&L.
+    """
 
     lim = max(1, int(settings.KELLY_LOOKBACK_TRADES))
     min_n = max(1, int(settings.KELLY_MIN_TRADES))
@@ -71,7 +75,7 @@ def compute_kelly_risk_scaling(
     if len(window) < min_n:
         return 1.0, fallback
 
-    wr, avg_w, avg_l, pf, n = _kelly_stats_from_pnls(list(window))
+    wr, avg_w, avg_l, pf, n = _kelly_stats_from_returns(list(window))
     avg_l = float(avg_l)
     if avg_l < 1e-9:
         fk = 0.0
@@ -147,18 +151,32 @@ class KellySizer:
                 sample_n=0,
             )
 
-        pnls = list(
-            self._database.get_recent_realized_pnls_for_kelly(
-                limit=int(self._settings.KELLY_LOOKBACK_TRADES),
-                exclude_simulation=True,
-            ),
-        )
+        data_kind = "return_pct" if bool(self._settings.KELLY_USE_RETURN_PCT) else "raw_pnl_legacy"
+        if bool(self._settings.KELLY_USE_RETURN_PCT) and hasattr(
+            self._database, "get_recent_realized_returns_for_kelly"
+        ):
+            pnls = list(
+                self._database.get_recent_realized_returns_for_kelly(
+                    limit=int(self._settings.KELLY_LOOKBACK_TRADES),
+                    exclude_simulation=True,
+                    exclude_canary=bool(self._settings.KELLY_EXCLUDE_CANARY),
+                    exclude_degraded=bool(self._settings.KELLY_EXCLUDE_DEGRADED_LABELS),
+                ),
+            )
+        else:
+            pnls = list(
+                self._database.get_recent_realized_pnls_for_kelly(
+                    limit=int(self._settings.KELLY_LOOKBACK_TRADES),
+                    exclude_simulation=True,
+                ),
+            )
         min_n = int(self._settings.KELLY_MIN_TRADES)
         if len(pnls) < min_n:
             self._log.info(
-                "event=kelly_sizing_fallback symbol=%s enabled=true multiplier=1.0 sample_size=%s "
+                "event=kelly_sizing_fallback symbol=%s enabled=true data_kind=%s multiplier=1.0 sample_size=%s "
                 "win_rate=n_a payoff_ratio=n_a base_risk_pct=%.8f adjusted_risk_pct=%.8f reason=insufficient_history",
                 symbol,
+                data_kind,
                 len(pnls),
                 float(base_risk_pct),
                 float(base_risk_pct),
@@ -198,13 +216,16 @@ class KellySizer:
         ) > 1e-12 else 0.0
 
         self._log.info(
-            "event=kelly_sizing_applied symbol=%s enabled=true multiplier=%.6f sample_size=%s "
-            "win_rate=%.6f payoff_ratio=%.6f base_risk_pct=%.8f adjusted_risk_pct=%.8f "
-            "kelly_fraction=%.6f capped=%s",
+            "event=kelly_sizing_applied symbol=%s enabled=true data_kind=%s multiplier=%.6f sample_size=%s "
+            "win_rate=%.6f avg_win_return=%.8f avg_loss_return=%.8f payoff_ratio=%.6f "
+            "base_risk_pct=%.8f adjusted_risk_pct=%.8f kelly_fraction=%.6f capped=%s",
             symbol,
+            data_kind,
             float(mult),
             sample_n,
             wr,
+            float(stats.get("avg_win", 0.0)),
+            float(stats.get("avg_loss", 0.0)),
             payoff,
             float(base_risk_pct),
             float(adj),

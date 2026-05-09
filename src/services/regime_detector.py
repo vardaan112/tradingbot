@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
 
@@ -44,8 +44,12 @@ class QqqRegimeDetector:
         # Conservative default: treat as bear-volatile until the first successful
         # fetch.  Prevents trading through a gap-down open while the hourly
         # refresh hasn't fired yet (up to 59 min exposure window).
+        fail_closed = bool(
+            settings.REGIME_FAIL_CLOSED_ON_STARTUP
+            and settings.REGIME_UNKNOWN_ACTION == "block_entries"
+        )
         self._snap = QqqRegimeSnapshot(
-            bear_volatile=True,
+            bear_volatile=fail_closed,
             close=0.0,
             sma50=0.0,
             atr1h=0.0,
@@ -73,6 +77,23 @@ class QqqRegimeDetector:
 
         if not self._settings.QQQ_REGIME_ENABLED:
             return
+        age_s = (now_utc - self._snap.updated_at).total_seconds()
+        if age_s > float(self._settings.REGIME_STALE_AFTER_SECONDS):
+            fail_closed = bool(
+                self._settings.REGIME_FAIL_CLOSED_ON_STARTUP
+                and self._settings.REGIME_UNKNOWN_ACTION == "block_entries"
+            )
+            self._snap = replace(
+                self._snap,
+                bear_volatile=bool(self._snap.bear_volatile or fail_closed),
+                error="stale_regime_data",
+            )
+            self._log.warning(
+                "event=regime_detector_stale age_seconds=%.3f action=%s block_entries=%s",
+                age_s,
+                self._settings.REGIME_UNKNOWN_ACTION,
+                str(fail_closed).lower(),
+            )
         hour_key = (now_utc.year, now_utc.month, now_utc.day, now_utc.hour)
         if self._last_refresh_hour_utc == hour_key:
             return
@@ -90,7 +111,13 @@ class QqqRegimeDetector:
         except Exception as exc:  # noqa: BLE001
             self._log.warning("regime_detector fetch failed symbol=%s err=%s", sym, exc)
             self._snap = QqqRegimeSnapshot(
-                bear_volatile=self._snap.bear_volatile,
+                bear_volatile=bool(
+                    self._snap.bear_volatile
+                    or (
+                        self._settings.REGIME_FAIL_CLOSED_ON_STARTUP
+                        and self._settings.REGIME_UNKNOWN_ACTION == "block_entries"
+                    )
+                ),
                 close=self._snap.close,
                 sma50=self._snap.sma50,
                 atr1h=self._snap.atr1h,
@@ -98,7 +125,18 @@ class QqqRegimeDetector:
                 atr_ratio=self._snap.atr_ratio,
                 updated_at=datetime.now(UTC),
                 error=f"fetch:{exc}",
+                anchor_symbol=self._snap.anchor_symbol,
+                anchor_close=self._snap.anchor_close,
+                anchor_sma=self._snap.anchor_sma,
+                anchor_rsi=self._snap.anchor_rsi,
+                anchor_state=self._snap.anchor_state,
             )
+            if self._snap.bear_volatile:
+                self._log.warning(
+                    "event=regime_unknown_block reason=refresh_failed action=%s err=%s",
+                    self._settings.REGIME_UNKNOWN_ACTION,
+                    exc,
+                )
             return self._snap
 
         snap = _compute_snapshot(df, self._settings, sym=sym)
@@ -137,14 +175,25 @@ class QqqRegimeDetector:
             snap.anchor_sma,
             snap.error or "n_a",
         )
+        if not snap.error:
+            self._log.info(
+                "event=regime_detector_ready status=%s symbol=%s anchor_state=%s",
+                status,
+                sym,
+                snap.anchor_state,
+            )
         return self._snap
 
 
 def _compute_snapshot(df: pd.DataFrame, settings: Settings, *, sym: str) -> QqqRegimeSnapshot:
     ts = datetime.now(UTC)
     if df is None or df.empty or len(df) < 55:
+        fail_closed = bool(
+            settings.REGIME_FAIL_CLOSED_ON_STARTUP
+            and settings.REGIME_UNKNOWN_ACTION == "block_entries"
+        )
         return QqqRegimeSnapshot(
-            bear_volatile=False,
+            bear_volatile=fail_closed,
             close=0.0,
             sma50=0.0,
             atr1h=0.0,
@@ -152,6 +201,7 @@ def _compute_snapshot(df: pd.DataFrame, settings: Settings, *, sym: str) -> QqqR
             atr_ratio=1.0,
             updated_at=ts,
             error="insufficient_bars",
+            anchor_symbol=str(settings.REGIME_ANCHOR_SYMBOL).upper(),
         )
     close = df["close"].astype(float)
     last_px = float(close.iloc[-1])

@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     LIVE_TRADING_ENABLED: bool = False
     DRY_RUN: bool = True
     CONFIRM_LIVE_TRADING: str = ""
+    # Research/correctness guardrails. BLOCK_LIVE_DEPLOYMENT is advisory and
+    # intentionally does not override the existing DRY_RUN/LIVE_TRADING gates.
+    BLOCK_LIVE_DEPLOYMENT: bool = True
+    ENABLE_RESEARCH_MODE: bool = True
+    BACKTEST_PREVENT_SAME_BAR_FILLS: bool = True
+    RESEARCH_REQUIRE_OOS_PASS: bool = True
 
     # ---- Logging and storage -------------------------------------------------------
     LOG_LEVEL: str = "INFO"
@@ -85,6 +91,7 @@ class Settings(BaseSettings):
     DYNAMIC_RSI_MAX: float = Field(35.0, ge=1.0, le=50.0)
     ATR_LOOKBACK: int = Field(50, ge=2, le=500)
     BOLLINGER_ENABLED: bool = False
+    ENABLE_BOLLINGER_CONFLUENCE: bool = False
     BOLLINGER_LENGTH: int = Field(20, ge=2, le=500)
     BOLLINGER_STD: float = Field(2.0, gt=0.0, le=10.0)
     BOLLINGER_MIN_WIDTH_PCT: float = Field(0.0, ge=0.0, le=1.0)
@@ -92,6 +99,8 @@ class Settings(BaseSettings):
     BOLLINGER_BW_MIN: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     BOLLINGER_REQUIRE_TOUCH: bool = False
     VWAP_STRATEGY_ENABLED: bool = False
+    ENABLE_VWAP_CONFLUENCE: bool = False
+    ENABLE_FILTER_SCORE_MODE: bool = False
     VWAP_LENGTH: int = Field(20, ge=2, le=500)
     VWAP_STD: float = Field(2.0, gt=0.0, le=10.0)
     VWAP_Z_THRESHOLD: float = Field(2.0, gt=0.0, le=10.0)
@@ -157,6 +166,10 @@ class Settings(BaseSettings):
     # wider than SIP). When unset (default), all feeds use SPREAD_FILTER_PCT.
     SPREAD_FILTER_PCT_IEX: Optional[float] = Field(default=None)
     SPREAD_FILTER_ELASTIC_ENABLED: bool = True
+    # Optional aliases; when unset, existing explicit settings keep behavior.
+    ENABLE_ELASTIC_SPREAD: Optional[bool] = None
+    ENABLE_QUOTE_FALLBACK: Optional[bool] = None
+    ENABLE_REGIME_ADAPTIVE_RSI: Optional[bool] = None
     # Absolute hard cap after all elasticity multipliers are applied.
     SPREAD_FILTER_MAX_PCT: float = Field(0.02, gt=0.0, le=0.25)
     SPREAD_FILTER_IEX_ELASTIC_MULTIPLIER: float = Field(1.75, ge=1.0, le=10.0)
@@ -212,6 +225,9 @@ class Settings(BaseSettings):
     REGIME_USE_SMA50: bool = True
     REGIME_MAX_EQUITY_REDUCTION: float = Field(0.5, ge=0.0, le=1.0)
     REGIME_BEAR_VOLATILE_BLOCK_ENTRIES: bool = False
+    REGIME_FAIL_CLOSED_ON_STARTUP: bool = True
+    REGIME_STALE_AFTER_SECONDS: float = Field(3900.0, gt=60.0, le=86_400.0)
+    REGIME_UNKNOWN_ACTION: Literal["block_entries", "reduce_size"] = "block_entries"
     REGIME_ATR_LENGTH: int = Field(14, ge=2, le=200)
     REGIME_ATR_MA_LENGTH: int = Field(50, ge=5, le=500)
 
@@ -347,17 +363,24 @@ class Settings(BaseSettings):
     )
 
     ENABLE_KELLY_SIZING: bool = False
+    KELLY_USE_RETURN_PCT: bool = True
     KELLY_LOOKBACK_TRADES: int = Field(100, ge=5, le=50_000)
     KELLY_FRACTION: float = Field(0.25, gt=0.0, le=1.0)
     KELLY_MIN_TRADES: int = Field(30, ge=5, le=50_000)
     KELLY_MAX_RISK_MULTIPLIER: float = Field(1.5, gt=0.0, le=5.0)
     KELLY_MIN_RISK_MULTIPLIER: float = Field(0.25, gt=0.0, le=5.0)
+    # Optional aliases requested by the research guardrail spec.
+    KELLY_MAX_MULTIPLIER: Optional[float] = Field(default=None, gt=0.0, le=5.0)
+    KELLY_MIN_MULTIPLIER: Optional[float] = Field(default=None, gt=0.0, le=5.0)
+    KELLY_EXCLUDE_CANARY: bool = True
+    KELLY_EXCLUDE_DEGRADED_LABELS: bool = True
 
     ANTI_MARTINGALE_ENABLED: bool = False
     ANTI_MARTINGALE_LOSS_STREAK: int = Field(3, ge=1, le=50)
     ANTI_MARTINGALE_WIN_RECOVERY: int = Field(2, ge=1, le=50)
     ANTI_MARTINGALE_DEFENSIVE_MULTIPLIER: float = Field(0.5, gt=0.0, le=1.0)
     ANTI_MARTINGALE_NORMAL_MULTIPLIER: float = Field(1.0, gt=0.0, le=1.0)
+    ENABLE_REALIZED_CORRELATION: bool = True
 
     REPORTS_DIR: Path = Path("./reports")
     DAILY_REPORT_ENABLED: bool = False
@@ -447,6 +470,8 @@ class Settings(BaseSettings):
         "ELASTIC_SPREAD_HARD_MAX_PCT",
         "QUOTE_MAX_AGE_SECONDS",
         "DISCORD_SKIP_ALERT_COOLDOWN_SECONDS",
+        "KELLY_MAX_MULTIPLIER",
+        "KELLY_MIN_MULTIPLIER",
         mode="before",
     )
     @classmethod
@@ -541,10 +566,16 @@ class Settings(BaseSettings):
     def _validate_consistency(self) -> "Settings":
         if self.MAX_DOLLARS_PER_TRADE > 0:
             self.MAX_EQUITY_USAGE_USD = float(self.MAX_DOLLARS_PER_TRADE)
+        if self.ENABLE_ELASTIC_SPREAD is not None:
+            self.SPREAD_FILTER_ELASTIC_ENABLED = bool(self.ENABLE_ELASTIC_SPREAD)
         if self.ELASTIC_SPREAD_ENABLED is not None:
             self.SPREAD_FILTER_ELASTIC_ENABLED = bool(self.ELASTIC_SPREAD_ENABLED)
         if self.ELASTIC_SPREAD_HARD_MAX_PCT is not None:
             self.SPREAD_FILTER_MAX_PCT = float(self.ELASTIC_SPREAD_HARD_MAX_PCT)
+        if self.ENABLE_QUOTE_FALLBACK is not None:
+            self.QUOTE_FALLBACK_ENABLED = bool(self.ENABLE_QUOTE_FALLBACK)
+        if self.ENABLE_REGIME_ADAPTIVE_RSI is not None:
+            self.REGIME_ADAPTIVE_RSI_ENABLED = bool(self.ENABLE_REGIME_ADAPTIVE_RSI)
         if self.QUOTE_MAX_AGE_SECONDS is not None:
             self.QUOTE_STALENESS_SECONDS = float(self.QUOTE_MAX_AGE_SECONDS)
         if self.DISCORD_SKIP_ALERT_COOLDOWN_SECONDS is not None:
@@ -562,6 +593,12 @@ class Settings(BaseSettings):
             self.BOLLINGER_MIN_WIDTH_PCT = float(self.BOLLINGER_BW_MIN)
         if self.ADX_THRESHOLD is not None:
             self.ADX_RANGE_MAX = float(self.ADX_THRESHOLD)
+        if self.KELLY_MAX_MULTIPLIER is not None:
+            self.KELLY_MAX_RISK_MULTIPLIER = float(self.KELLY_MAX_MULTIPLIER)
+        if self.KELLY_MIN_MULTIPLIER is not None:
+            self.KELLY_MIN_RISK_MULTIPLIER = float(self.KELLY_MIN_MULTIPLIER)
+        if self.KELLY_MIN_RISK_MULTIPLIER > self.KELLY_MAX_RISK_MULTIPLIER:
+            raise ValueError("KELLY_MIN_RISK_MULTIPLIER must be <= KELLY_MAX_RISK_MULTIPLIER.")
         # Live trading requires explicit confirmation phrase.
         if (
             self.ALPACA_ENV == ALPACA_ENV_LIVE
