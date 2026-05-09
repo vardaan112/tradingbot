@@ -72,9 +72,15 @@ def _stub_regime(settings: Settings) -> RegimeSnapshot:
     )
 
 
-@dataclass
+@dataclass(frozen=True)
 class TrailState:
-    """Per-symbol trailing-profit engine state."""
+    """Per-symbol trailing-profit engine state.
+
+    Frozen so the only way to update is to construct a new instance and
+    write it through ``_with_trail_update`` — preventing in-place mutation
+    that could desync memory from the persisted snapshot on a mid-update
+    exception.
+    """
 
     avg_entry_price: float
     trailing_stop_active: bool
@@ -170,6 +176,33 @@ class RSIMeanReversionStrategy(Strategy):
                 target_a_hit=st.target_a_hit,
             )
         self._state_store.save_trailing_states(payload)
+
+    def _with_trail_update(
+        self,
+        symbol: str,
+        fn: Callable[[TrailState], TrailState],
+    ) -> TrailState:
+        """Apply ``fn`` to the trail for ``symbol``, persist, and commit atomically.
+
+        Reads current snapshot, builds an updated frozen instance via ``fn``,
+        commits in-memory, then persists. If persistence raises, rolls back
+        the in-memory swap so disk and memory remain consistent.
+        """
+
+        sym_u = symbol.upper()
+        current = self._trails_by_symbol.get(sym_u)
+        if current is None:
+            raise KeyError(f"no trail bound for {sym_u}")
+        updated = fn(current)
+        if updated is current:
+            return current
+        self._trails_by_symbol[sym_u] = updated
+        try:
+            self._persist_trailing_to_disk()
+        except Exception:
+            self._trails_by_symbol[sym_u] = current
+            raise
+        return updated
 
     # ------------------------------------------------------------------ helpers
 
@@ -1075,26 +1108,37 @@ class RSIMeanReversionStrategy(Strategy):
 
             # Update synthetic trailing BEFORE comparing breach for this closed bar.
             unreal_pct = safe_unreal_pct(last_close, entry_price)
-            if not trail.trailing_stop_active:
-                if unreal_pct >= self._settings.TRAIL_TRIGGER_PCT:
-                    trail.target_a_hit = True
-                    trail.trailing_stop_active = True
-                    trail.locked_floor = entry_price * (1.0 + self._settings.TRAIL_LOCKED_PROFIT_PCT)
-                    trail.highest_close_since_activation = max(last_close, entry_price)
-                    atr_line = (
-                        trail.highest_close_since_activation
-                        - self._thr.trail_atr_multiplier * last_atr
-                    )
-                    trail.trailing_stop_price = max(trail.locked_floor, atr_line)
-            else:
-                trail.target_a_hit = True
-                trail.highest_close_since_activation = max(
-                    trail.highest_close_since_activation, last_close
-                )
-                atr_line = trail.highest_close_since_activation - self._thr.trail_atr_multiplier * last_atr
-                trail.trailing_stop_price = max(trail.locked_floor, atr_line)
+            trail_atr_mult = self._thr.trail_atr_multiplier
+            trail_trigger_pct = self._settings.TRAIL_TRIGGER_PCT
+            trail_locked_profit_pct = self._settings.TRAIL_LOCKED_PROFIT_PCT
 
-            self._trails_by_symbol[symbol] = trail
+            def _update_trail(t: TrailState) -> TrailState:
+                if not t.trailing_stop_active:
+                    if unreal_pct < trail_trigger_pct:
+                        return t
+                    locked = entry_price * (1.0 + trail_locked_profit_pct)
+                    hi = max(last_close, entry_price)
+                    atr_line = hi - trail_atr_mult * last_atr
+                    return TrailState(
+                        avg_entry_price=t.avg_entry_price,
+                        trailing_stop_active=True,
+                        locked_floor=locked,
+                        highest_close_since_activation=hi,
+                        trailing_stop_price=max(locked, atr_line),
+                        target_a_hit=True,
+                    )
+                hi = max(t.highest_close_since_activation, last_close)
+                atr_line = hi - trail_atr_mult * last_atr
+                return TrailState(
+                    avg_entry_price=t.avg_entry_price,
+                    trailing_stop_active=True,
+                    locked_floor=t.locked_floor,
+                    highest_close_since_activation=hi,
+                    trailing_stop_price=max(t.locked_floor, atr_line),
+                    target_a_hit=True,
+                )
+
+            trail = self._with_trail_update(symbol, _update_trail)
 
             if trail.trailing_stop_active and last_close <= trail.trailing_stop_price + 1e-12:
                 md = self._regime_overlay(

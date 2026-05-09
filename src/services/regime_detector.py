@@ -41,18 +41,28 @@ class QqqRegimeDetector:
         self._settings = settings
         self._bars = bar_fetcher
         self._log = logging.getLogger(LOGGER_APP)
+        # Conservative default: treat as bear-volatile until the first successful
+        # fetch.  Prevents trading through a gap-down open while the hourly
+        # refresh hasn't fired yet (up to 59 min exposure window).
         self._snap = QqqRegimeSnapshot(
-            bear_volatile=False,
+            bear_volatile=True,
             close=0.0,
             sma50=0.0,
             atr1h=0.0,
             atr_ma=0.0,
             atr_ratio=1.0,
             updated_at=datetime.now(UTC),
-            error="init",
+            error="init_pending",
             anchor_symbol=str(settings.REGIME_ANCHOR_SYMBOL).upper(),
         )
         self._last_refresh_hour_utc: Optional[tuple[int, int, int, int]] = None
+        if settings.QQQ_REGIME_ENABLED:
+            try:
+                self.refresh()
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(
+                    "event=regime_startup_refresh_failed err=%s will_stay_conservative=true", exc
+                )
 
     @property
     def snapshot(self) -> QqqRegimeSnapshot:
