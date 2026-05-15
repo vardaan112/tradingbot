@@ -44,6 +44,7 @@ dev = [
 [project.scripts]
 tradingbot = "main:main"
 backtest-bot = "utils.backtester:main"
+replay-bot = "sim.replay:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

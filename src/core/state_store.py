@@ -331,6 +331,7 @@ def reconcile_open_positions(
     strategy_name: str = "strategy",
     eps_qty: float = 0.05,
     eps_avg_rel: float = 0.001,
+    execution_event_source: Optional[str] = None,
 ) -> RecoverySummary:
     """Delegate to ``core.position_ledger.reconcile_open_positions`` (avoid cycles)."""
 
@@ -345,4 +346,5 @@ def reconcile_open_positions(
         strategy_name=strategy_name,
         eps_qty=eps_qty,
         eps_avg_rel=eps_avg_rel,
+        execution_event_source=execution_event_source,
     )

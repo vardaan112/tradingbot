@@ -123,6 +123,85 @@ class Settings(BaseSettings):
     ATR_PROFIT_MULTIPLIER: float = Field(3.0, gt=0.0, le=50.0)
     MAX_HOLD_BARS: int = Field(24, ge=1, le=10_000)
 
+    # ---- Phase 2: multi-strategy registry / engine (evaluation only) ------------
+    ACTIVE_STRATEGIES: str = "rsi_mean_reversion"
+    STRATEGY_RUN_MODE: Literal["single", "independent", "ensemble", "both"] = "single"
+    STRATEGY_WEIGHTS_JSON: str = '{"rsi_mean_reversion":1.0}'
+    ENSEMBLE_ENABLED: bool = False
+    ENSEMBLE_ENTER_THRESHOLD: float = Field(0.55, ge=0.0, le=1.0)
+    ENSEMBLE_EXIT_THRESHOLD: float = Field(0.50, ge=0.0, le=1.0)
+    ENSEMBLE_MIN_AGREEING_STRATEGIES: int = Field(1, ge=1, le=50)
+    ENSEMBLE_EXIT_POLICY: Literal["weighted", "any", "risk_first"] = "risk_first"
+    ENSEMBLE_WEIGHT_MODE: Literal["static", "performance"] = "static"
+    ENSEMBLE_PERFORMANCE_SOURCE: Literal["replay", "shadow", "paper", "live"] = "shadow"
+    ENSEMBLE_PERFORMANCE_LOOKBACK_DAYS: int = Field(30, ge=1, le=730)
+    ENSEMBLE_MIN_TRADES_FOR_WEIGHT: int = Field(10, ge=1, le=10_000)
+    ENSEMBLE_WEIGHT_SMOOTHING_ALPHA: float = Field(0.2, ge=0.0, le=1.0)
+    ALLOW_LIVE_PERFORMANCE_WEIGHTS: bool = False
+    ENSEMBLE_MAX_WEIGHT: float = Field(0.60, gt=0.0, le=1.0)
+    ENSEMBLE_MIN_WEIGHT: float = Field(0.05, gt=0.0, le=1.0)
+
+    # ---- Phase 7: live shadow portfolios (no broker orders) -----------------------
+    SHADOW_TRADING_ENABLED: bool = False
+    SHADOW_INITIAL_EQUITY: float = Field(10_000.0, gt=0.0)
+    SHADOW_RECORD_INTERVAL_SECONDS: float = Field(60.0, ge=1.0, le=86_400.0)
+    SHADOW_FILL_MODEL: Literal["midpoint", "conservative_quote"] = "conservative_quote"
+
+    # ---- Phase 3: additional strategies (disabled by default) ----------------------
+    MOMENTUM_ENABLED: bool = True
+    MOMENTUM_FAST_SMA: int = Field(20, ge=2, le=500)
+    MOMENTUM_SLOW_SMA: int = Field(50, ge=3, le=500)
+    MOMENTUM_LOOKBACK_BARS: int = Field(20, ge=2, le=500)
+    MOMENTUM_MIN_RETURN_PCT: float = Field(0.02, ge=0.0, le=1.0)
+    MOMENTUM_ADX_MIN: float = Field(20.0, ge=0.0, le=100.0)
+    MOMENTUM_REQUIRE_ADX: bool = True
+    MOMENTUM_EXIT_SMA: int = Field(20, ge=2, le=500)
+    MOMENTUM_ATR_STOP_MULT: float = Field(2.0, gt=0.0, le=20.0)
+    MOMENTUM_MAX_HOLD_BARS: int = Field(24, ge=1, le=10_000)
+    MOMENTUM_VOLUME_MA_BARS: int = Field(20, ge=2, le=500)
+    MOMENTUM_VOLUME_FACTOR: float = Field(0.9, ge=0.0, le=5.0)
+
+    BREAKOUT_ENABLED: bool = True
+    BREAKOUT_LOOKBACK_BARS: int = Field(20, ge=2, le=500)
+    BREAKOUT_VOLUME_MULTIPLIER: float = Field(1.5, ge=1.0, le=10.0)
+    BREAKOUT_ATR_BUFFER_MULTIPLIER: float = Field(0.1, ge=0.0, le=5.0)
+    BREAKOUT_MAX_HOLD_BARS: int = Field(24, ge=1, le=10_000)
+    BREAKOUT_VOLUME_MA_BARS: int = Field(20, ge=2, le=500)
+    BREAKOUT_ATR_STOP_MULT: float = Field(2.0, gt=0.0, le=20.0)
+    BREAKOUT_ATR_TARGET_MULT: float = Field(3.0, gt=0.0, le=20.0)
+    BREAKOUT_TRAIL_ATR_MULT: float = Field(2.0, gt=0.0, le=20.0)
+
+    VWAP_PULLBACK_ENABLED: bool = True
+    VWAP_PULLBACK_LENGTH: int = Field(20, ge=2, le=500)
+    VWAP_PULLBACK_Z_THRESHOLD: float = Field(2.0, gt=0.0, le=10.0)
+    VWAP_PULLBACK_MAX_DISTANCE_PCT: float = Field(0.003, ge=0.0, le=0.2)
+    VWAP_PULLBACK_MIN_TREND_SLOPE: float = Field(0.0, ge=-10.0, le=10.0)
+    VWAP_PULLBACK_RSI_MIN: float = Field(35.0, ge=1.0, le=99.0)
+    VWAP_PULLBACK_RSI_MAX: float = Field(60.0, ge=1.0, le=99.0)
+    VWAP_PULLBACK_ADX_MIN: float = Field(12.0, ge=0.0, le=100.0)
+    VWAP_PULLBACK_ADX_MAX: float = Field(45.0, ge=0.0, le=100.0)
+    VWAP_PULLBACK_TREND_FAST_SMA: int = Field(10, ge=2, le=200)
+    VWAP_PULLBACK_TREND_SLOW_SMA: int = Field(30, ge=3, le=500)
+    VWAP_PULLBACK_MAX_ZSCORE: float = Field(-0.2, ge=-5.0, le=5.0)
+    VWAP_PULLBACK_EXIT_Z_MIN: float = Field(-0.25, ge=-5.0, le=5.0)
+    VWAP_PULLBACK_ATR_STOP_MULT: float = Field(2.0, gt=0.0, le=20.0)
+    VWAP_PULLBACK_ATR_TARGET_MULT: float = Field(2.5, gt=0.0, le=20.0)
+    VWAP_PULLBACK_MAX_HOLD_BARS: int = Field(36, ge=1, le=10_000)
+
+    ETF_ROTATION_ENABLED: bool = True
+    ETF_ROTATION_SYMBOLS: str = "SPY,QQQ,IWM,XLK,XLF,XLE,TLT,GLD"
+    ETF_ROTATION_LOOKBACK_BARS: int = Field(63, ge=5, le=500)
+    ETF_ROTATION_TOP_N: int = Field(1, ge=1, le=20)
+    ETF_ROTATION_MIN_SCORE: float = Field(0.0, ge=-10.0, le=10.0)
+    ETF_ROTATION_TREND_SMA: int = Field(20, ge=2, le=200)
+    ETF_ROTATION_REBALANCE_BARS: int = Field(12, ge=1, le=500)
+
+    PAIRS_ENABLED: bool = True
+    PAIRS_CONFIG_JSON: str = '{"QQQ":"SPY"}'
+    PAIRS_LOOKBACK_BARS: int = Field(100, ge=10, le=2000)
+    PAIRS_ENTRY_Z: float = Field(-2.0, ge=-10.0, le=0.0)
+    PAIRS_EXIT_Z: float = Field(-0.5, ge=-10.0, le=10.0)
+
     # ---- Regime & synthetic trailing-profit (Phase Two) ----------------------------
     ADX_LENGTH: int = Field(14, ge=2, le=500)
     ADX_RANGE_MAX: float = Field(25.0, gt=0.0, le=100.0)
@@ -510,6 +589,101 @@ class Settings(BaseSettings):
             raise ValueError("time-of-day HH:MM must be within 00:00..23:59")
         return f"{hour:02d}:{minute:02d}"
 
+    @field_validator("ACTIVE_STRATEGIES")
+    @classmethod
+    def _validate_active_strategies(cls, value: str) -> str:
+        from strategies.registry import normalize_strategy_name, supported_strategy_names
+
+        raw = (value or "").strip()
+        if not raw:
+            raise ValueError("ACTIVE_STRATEGIES must list at least one strategy name")
+        known = supported_strategy_names()
+        out: list[str] = []
+        for chunk in raw.split(","):
+            token = chunk.strip()
+            if not token:
+                raise ValueError("ACTIVE_STRATEGIES must not contain empty names")
+            canon = normalize_strategy_name(token)
+            if canon not in known:
+                raise ValueError(
+                    f"ACTIVE_STRATEGIES unknown strategy {token!r} "
+                    f"(canonical={canon!r}; supported={sorted(known)})",
+                )
+            out.append(canon)
+        return ",".join(out)
+
+    @field_validator("STRATEGY_WEIGHTS_JSON")
+    @classmethod
+    def _validate_strategy_weights_json(cls, value: str) -> str:
+        from strategies.registry import normalize_strategy_name, supported_strategy_names
+
+        raw = (value or "").strip()
+        if not raw:
+            raise ValueError("STRATEGY_WEIGHTS_JSON must not be empty")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"STRATEGY_WEIGHTS_JSON must be valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("STRATEGY_WEIGHTS_JSON must decode to a JSON object")
+        known = supported_strategy_names()
+        weights: dict[str, float] = {}
+        for k, v in parsed.items():
+            ks = str(k).strip()
+            if not ks:
+                raise ValueError("STRATEGY_WEIGHTS_JSON keys must be non-empty")
+            canon = normalize_strategy_name(ks)
+            if canon not in known:
+                raise ValueError(
+                    f"STRATEGY_WEIGHTS_JSON unknown strategy key {k!r} "
+                    f"(canonical={canon!r}; supported={sorted(known)})",
+                )
+            try:
+                fv = float(v)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"STRATEGY_WEIGHTS_JSON value for {k!r} must be numeric") from exc
+            if fv < 0.0 or fv > 1_000_000.0:
+                raise ValueError(f"STRATEGY_WEIGHTS_JSON weight for {k!r} out of range")
+            weights[canon] = fv
+        return json.dumps(weights, separators=(",", ":"))
+
+    @field_validator("ETF_ROTATION_SYMBOLS")
+    @classmethod
+    def _validate_etf_rotation_symbols(cls, v: str) -> str:
+        cleaned = ",".join(s.strip().upper() for s in v.split(",") if s.strip())
+        if not cleaned:
+            raise ValueError("ETF_ROTATION_SYMBOLS requires at least one symbol")
+        for sym in cleaned.split(","):
+            if not sym.isascii() or not all(c.isalnum() or c in {".", "-", "/"} for c in sym):
+                raise ValueError(f"ETF_ROTATION_SYMBOLS invalid ticker: {sym!r}")
+        return cleaned
+
+    @field_validator("PAIRS_CONFIG_JSON")
+    @classmethod
+    def _validate_pairs_config_json(cls, value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return "{}"
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"PAIRS_CONFIG_JSON must be valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("PAIRS_CONFIG_JSON must decode to a JSON object")
+        out: dict[str, str] = {}
+        for k, v in parsed.items():
+            fk = str(k).strip().upper()
+            lv = str(v).strip().upper()
+            if not fk or not lv:
+                raise ValueError("PAIRS_CONFIG_JSON keys and values must be non-empty tickers")
+            for sym in (fk, lv):
+                if not sym.isascii() or not all(c.isalnum() or c in {".", "-", "/"} for c in sym):
+                    raise ValueError(f"PAIRS_CONFIG_JSON invalid ticker: {sym!r}")
+            if fk == lv:
+                raise ValueError("PAIRS_CONFIG_JSON follower and leader must differ")
+            out[fk] = lv
+        return json.dumps(out, separators=(",", ":"))
+
     @field_validator("SECTOR_MAP_JSON")
     @classmethod
     def _validate_sector_map_json(cls, value: str) -> str:
@@ -639,8 +813,22 @@ class Settings(BaseSettings):
             raise ValueError("SCALE_IN_RSI_THRESHOLD must be between 1 and 50.")
         if self.SCALE_IN_ADD_QTY <= 0:
             raise ValueError("SCALE_IN_ADD_QTY must be > 0.")
-        if self.MAX_BULLETS_PER_SYMBOL < 1:
-            raise ValueError("MAX_BULLETS_PER_SYMBOL must be >= 1.")
+        if self.VWAP_PULLBACK_TREND_FAST_SMA >= self.VWAP_PULLBACK_TREND_SLOW_SMA:
+            raise ValueError("VWAP_PULLBACK_TREND_FAST_SMA must be < VWAP_PULLBACK_TREND_SLOW_SMA.")
+        if self.MOMENTUM_FAST_SMA >= self.MOMENTUM_SLOW_SMA:
+            raise ValueError("MOMENTUM_FAST_SMA must be < MOMENTUM_SLOW_SMA.")
+        if self.VWAP_PULLBACK_RSI_MIN >= self.VWAP_PULLBACK_RSI_MAX:
+            raise ValueError("VWAP_PULLBACK_RSI_MIN must be < VWAP_PULLBACK_RSI_MAX.")
+        if self.VWAP_PULLBACK_ADX_MIN > self.VWAP_PULLBACK_ADX_MAX:
+            raise ValueError("VWAP_PULLBACK_ADX_MIN must be <= VWAP_PULLBACK_ADX_MAX.")
+        if self.PAIRS_EXIT_Z <= self.PAIRS_ENTRY_Z:
+            raise ValueError("PAIRS_EXIT_Z must be > PAIRS_ENTRY_Z for convergence exits.")
+        if self.STRATEGY_RUN_MODE == "single":
+            names = self.active_strategies_list
+            if len(names) != 1:
+                raise ValueError(
+                    "STRATEGY_RUN_MODE=single requires exactly one strategy in ACTIVE_STRATEGIES",
+                )
         # Retry bounds
         if self.RETRY_BASE_DELAY_SECONDS > self.RETRY_MAX_DELAY_SECONDS:
             raise ValueError(
@@ -651,6 +839,8 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_PATH must not be empty")
         if not str(self.REPORTS_DIR).strip():
             raise ValueError("REPORTS_DIR must not be empty")
+        if self.ENSEMBLE_MIN_WEIGHT > self.ENSEMBLE_MAX_WEIGHT:
+            raise ValueError("ENSEMBLE_MIN_WEIGHT must be <= ENSEMBLE_MAX_WEIGHT.")
         return self
 
     # ---- Convenience ---------------------------------------------------------------
@@ -658,6 +848,30 @@ class Settings(BaseSettings):
     def symbols_list(self) -> list[str]:
         """Return SYMBOLS as a clean uppercase list."""
         return [s for s in self.SYMBOLS.split(",") if s]
+
+    @property
+    def active_strategies_list(self) -> list[str]:
+        """Canonical strategy keys from ``ACTIVE_STRATEGIES`` (order preserved)."""
+        return [s for s in self.ACTIVE_STRATEGIES.split(",") if s]
+
+    @property
+    def strategy_weights_dict(self) -> dict[str, float]:
+        """Weights keyed by canonical strategy name (defaults missing actives to 1.0)."""
+        try:
+            raw = json.loads(self.STRATEGY_WEIGHTS_JSON or "{}")
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, float] = {}
+        for k, v in raw.items():
+            try:
+                out[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+        for name in self.active_strategies_list:
+            out.setdefault(name, 1.0)
+        return out
 
     @property
     def discord_allowed_user_ids_set(self) -> set[int]:

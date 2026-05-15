@@ -17,8 +17,22 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from config.constants import LOGGER_APP
+from core.trade_source import sql_broker_eligible_sources_clause
 
 _LOG = logging.getLogger(LOGGER_APP)
+
+
+def _json_metadata(metadata: Optional[dict[str, Any]]) -> Optional[str]:
+    if not metadata:
+        return None
+    return json.dumps(metadata, sort_keys=True)
+
+
+def _norm_run_id(run_id: Optional[str]) -> Optional[str]:
+    if run_id is None:
+        return None
+    s = str(run_id).strip()
+    return s or None
 
 
 @dataclass(frozen=True)
@@ -53,7 +67,7 @@ class CompletedTradeRow:
 class Database:
     """Lightweight SQLite access for Phase 4 analytics."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: Path | str) -> None:
         self._path = Path(path)
@@ -176,6 +190,108 @@ class Database:
         self.apply_migrations()
         _LOG.info("event=db_schema_initialized path=%s", self._path)
 
+    def _ensure_research_event_tables(self, conn: sqlite3.Connection) -> None:
+        """Phase 1: research / replay / signal event tables (CREATE IF NOT EXISTS)."""
+
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS replay_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT UNIQUE NOT NULL,
+              created_at TEXT NOT NULL,
+              start_time TEXT NOT NULL,
+              end_time TEXT NOT NULL,
+              lookback_days INTEGER,
+              timeframe TEXT NOT NULL,
+              symbols_json TEXT NOT NULL,
+              strategies_json TEXT NOT NULL,
+              mode TEXT NOT NULL,
+              initial_equity REAL NOT NULL,
+              data_feed TEXT,
+              benchmark_symbol TEXT NOT NULL DEFAULT 'SPY',
+              settings_json TEXT,
+              status TEXT NOT NULL,
+              error TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS strategy_signals (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT,
+              source TEXT NOT NULL,
+              timestamp TEXT NOT NULL,
+              symbol TEXT NOT NULL,
+              strategy_name TEXT NOT NULL,
+              action TEXT NOT NULL,
+              confidence REAL,
+              reference_price REAL,
+              reason TEXT,
+              metadata_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS strategy_decisions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT,
+              source TEXT NOT NULL,
+              timestamp TEXT NOT NULL,
+              symbol TEXT NOT NULL,
+              decision_type TEXT,
+              final_action TEXT NOT NULL,
+              weighted_score REAL,
+              threshold REAL,
+              contributing_signals_json TEXT,
+              metadata_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT,
+              source TEXT NOT NULL,
+              timestamp TEXT NOT NULL,
+              strategy_name TEXT,
+              cash REAL,
+              equity REAL,
+              realized_pnl REAL,
+              unrealized_pnl REAL,
+              gross_exposure REAL,
+              net_exposure REAL,
+              benchmark_equity REAL,
+              metadata_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS skip_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT,
+              source TEXT NOT NULL,
+              timestamp TEXT NOT NULL,
+              symbol TEXT,
+              strategy_name TEXT,
+              phase TEXT,
+              skip_code TEXT,
+              message TEXT,
+              metadata_json TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_replay_runs_created
+              ON replay_runs(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_replay_runs_status
+              ON replay_runs(status);
+            CREATE INDEX IF NOT EXISTS idx_strategy_signals_run_ts
+              ON strategy_signals(run_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_strategy_signals_src_sym
+              ON strategy_signals(source, symbol);
+            CREATE INDEX IF NOT EXISTS idx_strategy_decisions_run_ts
+              ON strategy_decisions(run_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_equity_snapshots_run_ts
+              ON equity_snapshots(run_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_equity_snapshots_src_ts
+              ON equity_snapshots(source, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_skip_events_run_ts
+              ON skip_events(run_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_skip_events_src_phase
+              ON skip_events(source, phase);
+            """
+        )
+
     def apply_migrations(self) -> None:
         """Additive ALTERs for simulations / replay."""
 
@@ -200,12 +316,29 @@ class Database:
         with self._lock:
             conn = self._connect()
             try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS schema_meta (
+                      key TEXT PRIMARY KEY,
+                      value TEXT NOT NULL
+                    );
+                    """
+                )
+
+                def _table_exists(table: str) -> bool:
+                    row = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (table,),
+                    ).fetchone()
+                    return row is not None
 
                 def _has_col(table: str, name: str) -> bool:
                     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
                     return any(str(r[1]) == name for r in rows)
 
                 for table, col, decl in specs:
+                    if not _table_exists(table):
+                        continue
                     if not _has_col(table, col):
                         try:
                             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
@@ -216,6 +349,7 @@ class Database:
                                 col,
                                 exc,
                             )
+                self._ensure_research_event_tables(conn)
                 conn.execute(
                     "INSERT OR REPLACE INTO schema_meta(key,value) VALUES(?, ?)",
                     ("version", str(self.SCHEMA_VERSION)),
@@ -385,6 +519,40 @@ class Database:
             for r in rows
         ]
 
+    def query_completed_trades_for_performance(
+        self,
+        *,
+        source: str,
+        closed_after_iso: str,
+        limit: int = 50_000,
+    ) -> list[sqlite3.Row]:
+        """Completed trades for ensemble performance weights (single ``source`` filter)."""
+
+        lim = max(1, min(int(limit), 100_000))
+        src = str(source).strip().lower()
+        sql = """
+        SELECT strategy_name, realized_pnl, realized_return, entry_notional,
+               quantity, entry_price, closed_at, COALESCE(source, 'live') AS source
+        FROM completed_trades
+        WHERE COALESCE(is_canary, 0) = 0
+          AND COALESCE(source, 'live') = ?
+          AND datetime(closed_at) >= datetime(?)
+          AND strategy_name IS NOT NULL
+          AND TRIM(strategy_name) != ''
+        ORDER BY datetime(closed_at) ASC
+        LIMIT ?
+        """
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    return list(conn.execute(sql, (src, closed_after_iso, lim)).fetchall())
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_read_error kind=query_perf_trades error=%s", exc)
+                return []
+
     def _day_bounds_et(self, trading_day: str) -> tuple[str, str]:
         """closed_at compares as ISO strings; bound full ET calendar day."""
         start = f"{trading_day}T00:00:00"
@@ -430,13 +598,15 @@ class Database:
     ) -> list[float]:
         if limit < 1:
             return []
-        sim_clause = " AND COALESCE(source,'live') NOT IN ('simulation') " if exclude_simulation else ""
+        # When True, restrict to broker path (live/paper); excludes simulation,
+        # replay, shadow, dry_run, and any future non-broker labels.
+        src_clause = sql_broker_eligible_sources_clause(enabled=exclude_simulation)
         sql = f"""
         SELECT realized_pnl FROM completed_trades
         WHERE COALESCE(is_canary, 0) = 0
           AND realized_pnl IS NOT NULL
           AND COALESCE(invalid_for_kelly, 0) = 0
-          {sim_clause}
+          {src_clause}
         ORDER BY datetime(closed_at) DESC
         LIMIT ?
         """
@@ -477,7 +647,7 @@ class Database:
 
         if limit < 1:
             return []
-        sim_clause = " AND COALESCE(source,'live') NOT IN ('simulation') " if exclude_simulation else ""
+        src_clause = sql_broker_eligible_sources_clause(enabled=exclude_simulation)
         canary_clause = " AND COALESCE(is_canary, 0) = 0 " if exclude_canary else ""
         degraded_clause = " AND COALESCE(invalid_for_kelly, 0) = 0 " if exclude_degraded else ""
         sql = f"""
@@ -493,7 +663,7 @@ class Database:
             OR (realized_pnl IS NOT NULL AND entry_notional IS NOT NULL AND entry_notional > 0)
         )
         {canary_clause}
-        {sim_clause}
+        {src_clause}
         {degraded_clause}
         ORDER BY datetime(closed_at) DESC
         LIMIT ?
@@ -545,7 +715,7 @@ class Database:
     ) -> list[dict[str, Any]]:
         if limit < 1:
             return []
-        sim_clause = " AND COALESCE(source,'live') NOT IN ('simulation') " if exclude_simulation else ""
+        src_clause = sql_broker_eligible_sources_clause(enabled=exclude_simulation)
         sql = f"""
         SELECT symbol, realized_pnl, opened_at, closed_at,
                sentiment_score, regime_type,
@@ -554,7 +724,7 @@ class Database:
         WHERE COALESCE(is_canary, 0) = 0
           AND realized_pnl IS NOT NULL
           AND COALESCE(invalid_for_ml, 0) = 0
-          {sim_clause}
+          {src_clause}
         ORDER BY datetime(closed_at) DESC
         LIMIT ?
         """
@@ -600,13 +770,13 @@ class Database:
         exclude_canary: bool = True,
         exclude_simulation: bool = True,
     ) -> int:
-        sim_clause = " AND COALESCE(source,'live') NOT IN ('simulation') " if exclude_simulation else ""
+        src_clause = sql_broker_eligible_sources_clause(enabled=exclude_simulation)
         canary_clause = " AND COALESCE(is_canary, 0) = 0 " if exclude_canary else ""
         sql = f"""
         SELECT COUNT(*) AS n FROM completed_trades
         WHERE realized_pnl IS NOT NULL
         {canary_clause}
-        {sim_clause}
+        {src_clause}
         """
         with self._lock:
             try:
@@ -624,7 +794,7 @@ class Database:
         sql = """
         SELECT COALESCE(SUM(realized_pnl), 0) AS s FROM completed_trades
         WHERE COALESCE(is_canary, 0) = 0
-          AND COALESCE(source,'live') NOT IN ('simulation')
+          AND COALESCE(source, 'live') IN ('live', 'paper')
           AND realized_pnl IS NOT NULL
         """
         with self._lock:
@@ -824,6 +994,490 @@ class Database:
                     conn.close()
             except sqlite3.Error:
                 return 0
+
+    # ------------------------------------------------------------------ Phase 1 research / events
+
+    def create_replay_run(
+        self,
+        *,
+        run_id: str,
+        start_time: str,
+        end_time: str,
+        timeframe: str,
+        symbols_json: str,
+        strategies_json: str,
+        mode: str,
+        initial_equity: float,
+        lookback_days: Optional[int] = None,
+        data_feed: Optional[str] = None,
+        benchmark_symbol: str = "SPY",
+        settings_json: Optional[str] = None,
+        status: str = "running",
+        error: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ) -> Optional[int]:
+        ts = created_at or datetime.now(timezone.utc).isoformat()
+        sql = """
+        INSERT INTO replay_runs (
+          run_id, created_at, start_time, end_time, lookback_days, timeframe,
+          symbols_json, strategies_json, mode, initial_equity, data_feed,
+          benchmark_symbol, settings_json, status, error
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """
+        args = (
+            run_id.strip(),
+            ts,
+            start_time,
+            end_time,
+            lookback_days,
+            timeframe,
+            symbols_json,
+            strategies_json,
+            mode,
+            float(initial_equity),
+            data_feed,
+            benchmark_symbol,
+            settings_json,
+            status,
+            error,
+        )
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    cur = conn.execute(sql, args)
+                    rid = int(cur.lastrowid)
+                    conn.commit()
+                    return rid
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_write_error kind=replay_run_create error=%s", exc)
+                return None
+
+    def finish_replay_run(
+        self,
+        *,
+        run_id: str,
+        status: str,
+        error: Optional[str] = None,
+    ) -> bool:
+        sql = "UPDATE replay_runs SET status = ?, error = ? WHERE run_id = ?"
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    cur = conn.execute(sql, (status, error, run_id.strip()))
+                    conn.commit()
+                    return int(cur.rowcount or 0) > 0
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_write_error kind=replay_run_finish error=%s", exc)
+                return False
+
+    def record_strategy_signal(
+        self,
+        *,
+        source: str,
+        timestamp: str,
+        symbol: str,
+        strategy_name: str,
+        action: str,
+        run_id: Optional[str] = None,
+        confidence: Optional[float] = None,
+        reference_price: Optional[float] = None,
+        reason: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[int]:
+        meta = _json_metadata(metadata)
+        sql = """
+        INSERT INTO strategy_signals (
+          run_id, source, timestamp, symbol, strategy_name, action,
+          confidence, reference_price, reason, metadata_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+        """
+        args = (
+            _norm_run_id(run_id),
+            source,
+            timestamp,
+            symbol.upper(),
+            strategy_name,
+            action,
+            confidence,
+            reference_price,
+            reason,
+            meta,
+        )
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    cur = conn.execute(sql, args)
+                    rid = int(cur.lastrowid)
+                    conn.commit()
+                    return rid
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_write_error kind=strategy_signal error=%s", exc)
+                return None
+
+    def record_strategy_decision(
+        self,
+        *,
+        source: str,
+        timestamp: str,
+        symbol: str,
+        final_action: str,
+        run_id: Optional[str] = None,
+        decision_type: Optional[str] = None,
+        weighted_score: Optional[float] = None,
+        threshold: Optional[float] = None,
+        contributing_signals_json: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[int]:
+        meta = _json_metadata(metadata)
+        sql = """
+        INSERT INTO strategy_decisions (
+          run_id, source, timestamp, symbol, decision_type, final_action,
+          weighted_score, threshold, contributing_signals_json, metadata_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)
+        """
+        args = (
+            _norm_run_id(run_id),
+            source,
+            timestamp,
+            symbol.upper(),
+            decision_type,
+            final_action,
+            weighted_score,
+            threshold,
+            contributing_signals_json,
+            meta,
+        )
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    cur = conn.execute(sql, args)
+                    rid = int(cur.lastrowid)
+                    conn.commit()
+                    return rid
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_write_error kind=strategy_decision error=%s", exc)
+                return None
+
+    def record_equity_snapshot(
+        self,
+        *,
+        source: str,
+        timestamp: str,
+        run_id: Optional[str] = None,
+        strategy_name: Optional[str] = None,
+        cash: Optional[float] = None,
+        equity: Optional[float] = None,
+        realized_pnl: Optional[float] = None,
+        unrealized_pnl: Optional[float] = None,
+        gross_exposure: Optional[float] = None,
+        net_exposure: Optional[float] = None,
+        benchmark_equity: Optional[float] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[int]:
+        meta = _json_metadata(metadata)
+        sql = """
+        INSERT INTO equity_snapshots (
+          run_id, source, timestamp, strategy_name, cash, equity,
+          realized_pnl, unrealized_pnl, gross_exposure, net_exposure,
+          benchmark_equity, metadata_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """
+        args = (
+            _norm_run_id(run_id),
+            source,
+            timestamp,
+            strategy_name,
+            cash,
+            equity,
+            realized_pnl,
+            unrealized_pnl,
+            gross_exposure,
+            net_exposure,
+            benchmark_equity,
+            meta,
+        )
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    cur = conn.execute(sql, args)
+                    rid = int(cur.lastrowid)
+                    conn.commit()
+                    return rid
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_write_error kind=equity_snapshot error=%s", exc)
+                return None
+
+    def record_skip_event(
+        self,
+        *,
+        source: str,
+        timestamp: str,
+        run_id: Optional[str] = None,
+        symbol: Optional[str] = None,
+        strategy_name: Optional[str] = None,
+        phase: Optional[str] = None,
+        skip_code: Optional[str] = None,
+        message: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[int]:
+        meta = _json_metadata(metadata)
+        sql = """
+        INSERT INTO skip_events (
+          run_id, source, timestamp, symbol, strategy_name, phase,
+          skip_code, message, metadata_json
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """
+        args = (
+            _norm_run_id(run_id),
+            source,
+            timestamp,
+            symbol.upper() if symbol else None,
+            strategy_name,
+            phase,
+            skip_code,
+            message,
+            meta,
+        )
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    cur = conn.execute(sql, args)
+                    rid = int(cur.lastrowid)
+                    conn.commit()
+                    return rid
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_write_error kind=skip_event error=%s", exc)
+                return None
+
+    def query_replay_runs(
+        self,
+        *,
+        status: Optional[str] = None,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        if limit < 1:
+            return []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        sql = f"""
+        SELECT * FROM replay_runs
+        {where}
+        ORDER BY datetime(created_at) DESC
+        LIMIT ?
+        """
+        params.append(limit)
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    return list(conn.execute(sql, tuple(params)).fetchall())
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_read_error kind=query_replay_runs error=%s", exc)
+                return []
+
+    def query_strategy_signals(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        source: Optional[str] = None,
+        symbol: Optional[str] = None,
+        strategy_name: Optional[str] = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        if limit < 1:
+            return []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        if strategy_name is not None:
+            clauses.append("strategy_name = ?")
+            params.append(strategy_name)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        sql = f"""
+        SELECT * FROM strategy_signals
+        {where}
+        ORDER BY datetime(timestamp) DESC, id DESC
+        LIMIT ?
+        """
+        params.append(limit)
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    return list(conn.execute(sql, tuple(params)).fetchall())
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_read_error kind=query_strategy_signals error=%s", exc)
+                return []
+
+    def query_strategy_decisions(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        source: Optional[str] = None,
+        symbol: Optional[str] = None,
+        decision_type: Optional[str] = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        if limit < 1:
+            return []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        if decision_type is not None:
+            clauses.append("COALESCE(decision_type, '') = ?")
+            params.append(decision_type)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        sql = f"""
+        SELECT * FROM strategy_decisions
+        {where}
+        ORDER BY datetime(timestamp) DESC, id DESC
+        LIMIT ?
+        """
+        params.append(limit)
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    return list(conn.execute(sql, tuple(params)).fetchall())
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_read_error kind=query_strategy_decisions error=%s", exc)
+                return []
+
+    def query_equity_snapshots(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        source: Optional[str] = None,
+        strategy_name: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        if limit < 1:
+            return []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if strategy_name is not None:
+            clauses.append("COALESCE(strategy_name, '') = ?")
+            params.append(strategy_name)
+        if start_time is not None:
+            clauses.append("datetime(timestamp) >= datetime(?)")
+            params.append(start_time)
+        if end_time is not None:
+            clauses.append("datetime(timestamp) <= datetime(?)")
+            params.append(end_time)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        sql = f"""
+        SELECT * FROM equity_snapshots
+        {where}
+        ORDER BY datetime(timestamp) ASC, id ASC
+        LIMIT ?
+        """
+        params.append(limit)
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    return list(conn.execute(sql, tuple(params)).fetchall())
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_read_error kind=query_equity_snapshots error=%s", exc)
+                return []
+
+    def query_skip_events(
+        self,
+        *,
+        run_id: Optional[str] = None,
+        source: Optional[str] = None,
+        symbol: Optional[str] = None,
+        phase: Optional[str] = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        if limit < 1:
+            return []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        if phase is not None:
+            clauses.append("phase = ?")
+            params.append(phase)
+        where = f"WHERE {' AND '.join(clauses)} " if clauses else ""
+        sql = f"""
+        SELECT * FROM skip_events
+        {where}
+        ORDER BY datetime(timestamp) DESC, id DESC
+        LIMIT ?
+        """
+        params.append(limit)
+        with self._lock:
+            try:
+                conn = self._connect()
+                try:
+                    return list(conn.execute(sql, tuple(params)).fetchall())
+                finally:
+                    conn.close()
+            except sqlite3.Error as exc:
+                _LOG.error("event=db_read_error kind=query_skip_events error=%s", exc)
+                return []
 
     def count_canary_results_for_calendar_day_et(
         self,

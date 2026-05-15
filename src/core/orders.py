@@ -27,6 +27,7 @@ from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
 
 from config.constants import LOGGER_ORDERS
 from config.settings import Settings
+from core.trade_source import runtime_trade_source
 from utils.ids import generate_client_order_id, short_uuid
 from utils.price_utils import round_to_tick, spread_pct
 
@@ -369,6 +370,7 @@ class OrderService:
                 "spread_bps": sp,
                 "reason": reason,
             },
+            source=runtime_trade_source(self._settings),
         )
 
     def _log_chase(

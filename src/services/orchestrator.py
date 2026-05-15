@@ -61,6 +61,7 @@ from core.orders import OrderService, WorkingOrder
 from core.position_ledger import reconcile_open_positions
 from core.skiplist import SymbolSkiplist
 from core.state_store import SessionSnapshot, StateStore
+from core.trade_source import runtime_trade_source
 from core.trading_stream import StreamHealth, TradingStreamRunner
 from risk.anti_martingale import (
     RiskMode,
@@ -75,6 +76,7 @@ from risk.killswitch import KillSwitch
 from risk.position_sizer import PositionSizer
 from strategies.base import Signal, SignalAction, StrategyContext
 from strategies.ml_filter import MLSignalFilter
+from strategies.registry import build_strategies
 from strategies.rsi_mean_reversion import RSIMeanReversionStrategy
 from strategies.indicators import atr as atr_indicator
 from strategies.skip_diagnostics import (
@@ -106,6 +108,9 @@ from utils.price_utils import round_to_tick, tick_size_for
 from .autotune import iso_week_token, run_autotune_job
 from .heartbeat import HeartbeatService
 from .reporter import generate_daily_report
+from .ensemble import WeightedEnsembleEngine, votes_to_contributing_json
+from .shadow_portfolio import ShadowPortfolioManager
+from .strategy_engine import StrategyEngine
 
 _TIMEFRAME_SECONDS: dict[str, float] = {
     "1Min": 60.0,
@@ -176,18 +181,41 @@ class Orchestrator:
         self._discord_task: asyncio.Task[Any] | None = None
         self._orchestrator_skip_throttle = SkipDiagnosticsThrottle()
         self._universe_skip_throttle = SkipDiagnosticsThrottle()
-        self._strategy = RSIMeanReversionStrategy(
+        discord_fn = (
+            (lambda spec, orch=self: enqueue_discord_alert(orch._discord_out, spec))
+            if settings.ENABLE_DISCORD_BOT
+            else None
+        )
+        self._strategies = build_strategies(
+            settings.active_strategies_list,
             settings,
             state_store=self._state,
             database=self._database,
             runtime_thresholds=self._strategy_runtime_thr,
             ml_filter=self._ml_filter,
-            discord_embed_fn=(
-                (lambda spec, orch=self: enqueue_discord_alert(orch._discord_out, spec))
-                if settings.ENABLE_DISCORD_BOT
-                else None
-            ),
+            discord_embed_fn=discord_fn,
         )
+        rsi_instances = [s for s in self._strategies if isinstance(s, RSIMeanReversionStrategy)]
+        if not rsi_instances:
+            raise ValueError(
+                "Orchestrator requires RSIMeanReversionStrategy in ACTIVE_STRATEGIES "
+                "(Phase 2: order path and reconcile still RSI-backed).",
+            )
+        self._strategy = rsi_instances[0]
+        self._strategy_engine = StrategyEngine(
+            self._strategies,
+            settings=settings,
+            database=self._database,
+            signal_source=None,
+            replay_run_id=None,
+        )
+        self._weighted_ensemble: WeightedEnsembleEngine | None = None
+        if settings.ENSEMBLE_ENABLED and settings.STRATEGY_RUN_MODE in ("ensemble", "both"):
+            self._weighted_ensemble = WeightedEnsembleEngine(settings, database=self._database)
+        self._perf_weight_refresh_mono: float | None = None
+        self._shadow_portfolios: ShadowPortfolioManager | None = None
+        if settings.SHADOW_TRADING_ENABLED and len(self._strategies) > 1:
+            self._shadow_portfolios = ShadowPortfolioManager(settings, self._database)
         self._universe = UniverseFilter(
             settings,
             strategy_name=self._strategy.name,
@@ -526,6 +554,7 @@ class Orchestrator:
             log=self._log,
             db=self._database,
             strategy_name=self._strategy.name,
+            execution_event_source=runtime_trade_source(self._settings),
         )
 
         if self._settings.DYNAMIC_UNIVERSE_ENABLED:
@@ -772,6 +801,7 @@ class Orchestrator:
             log=self._log,
             db=self._database,
             strategy_name=self._strategy.name,
+            execution_event_source=runtime_trade_source(self._settings),
         )
 
         self._record_position_closures()
@@ -780,7 +810,10 @@ class Orchestrator:
             self._settings,
             dyn_path=resolve_dynamic_params_path(self._settings),
         )
-        self._strategy.set_runtime_thresholds(self._strategy_runtime_thr)
+        for strat in self._strategies:
+            setter = getattr(strat, "set_runtime_thresholds", None)
+            if callable(setter):
+                setter(self._strategy_runtime_thr)
 
         nu = datetime.now(UTC)
         if (
@@ -920,9 +953,26 @@ class Orchestrator:
         t_preview = recent_trade_pnls_preview(tick_recent, 12)
         self._tick_anti_mart = (t_mode, t_mult, t_preview)
 
+        all_quotes_by_symbol: dict[str, Quote] = {}
+        if self._quote_cache is not None:
+            for s in tick_syms:
+                qq = self._quote_cache.get(s)
+                if qq is not None:
+                    all_quotes_by_symbol[s.upper()] = qq
+
         tick_now = now_utc()
         if self._regime_detector is not None:
             self._regime_detector.refresh_if_stale(now_utc=tick_now)
+
+        if (
+            self._weighted_ensemble is not None
+            and self._settings.ENSEMBLE_WEIGHT_MODE == "performance"
+        ):
+            now_m = time.monotonic()
+            interval = max(120.0, float(self._settings.ORCHESTRATOR_TICK_SECONDS) * 4.0)
+            if self._perf_weight_refresh_mono is None or (now_m - self._perf_weight_refresh_mono) >= interval:
+                self._weighted_ensemble.refresh_weights(record_decision=True)
+                self._perf_weight_refresh_mono = now_m
 
         for symbol in tick_syms:
             sym = symbol.upper()
@@ -1066,20 +1116,96 @@ class Orchestrator:
                 regime_anchor_sma=(
                     self._regime_detector.snapshot.anchor_sma if self._regime_detector else None
                 ),
+                all_bars_by_symbol=dict(self._bars_cache),
+                all_quotes_by_symbol=all_quotes_by_symbol,
             )
 
-            for signal in self._strategy.evaluate(ctx):
-                await self._handle_signal(
-                    signal,
-                    quote=quote,
-                    can_open=can_open,
-                    can_exit=can_exit,
-                    compliance_allow=compliance_decision.allow_new_entries,
-                    eligible=elig.eligible,
-                    eligibility_reason=elig.reason,
-                    eligibility_code=elig.code,
-                    bot_managed_notional=bot_managed_notional,
+            primary = self._strategy.name
+            raw_all = list(self._strategy_engine.evaluate(ctx))
+
+            ens_dec = None
+            ens_sig = None
+            if self._weighted_ensemble is not None:
+                ens_dec = self._weighted_ensemble.decide(
+                    sym,
+                    raw_all,
+                    has_position=sym in positions_by_symbol,
                 )
+                ens_sig = self._weighted_ensemble.to_signal(ens_dec)
+
+            if self._shadow_portfolios is not None:
+                self._shadow_portfolios.on_symbol(
+                    symbol=sym,
+                    timestamp_iso=ctx.now_utc.isoformat(),
+                    raw_signals=raw_all,
+                    quote=quote,
+                    ensemble_decision=ens_dec,
+                    ensemble_signal=ens_sig,
+                )
+
+            if self._weighted_ensemble is not None:
+                dec = ens_dec
+                assert dec is not None and ens_sig is not None
+                if self._database is not None:
+                    wscore = (
+                        float(dec.weighted_exit_score)
+                        if dec.final_action
+                        in (SignalAction.EXIT_LONG, SignalAction.EMERGENCY_EXIT_LONG)
+                        else float(dec.weighted_enter_score)
+                    )
+                    th = (
+                        float(dec.exit_threshold)
+                        if dec.final_action
+                        in (SignalAction.EXIT_LONG, SignalAction.EMERGENCY_EXIT_LONG)
+                        else float(dec.enter_threshold)
+                    )
+                    self._database.record_strategy_decision(
+                        source=runtime_trade_source(self._settings),
+                        timestamp=ctx.now_utc.isoformat(),
+                        symbol=sym,
+                        final_action=dec.final_action.value,
+                        run_id=None,
+                        decision_type="weighted_ensemble",
+                        weighted_score=wscore,
+                        threshold=th,
+                        contributing_signals_json=votes_to_contributing_json(dec.contributing_votes),
+                        metadata={
+                            "weighted_enter_score": dec.weighted_enter_score,
+                            "weighted_exit_score": dec.weighted_exit_score,
+                            "ensemble_reason": dec.reason,
+                        },
+                    )
+                sig = ens_sig
+                if (
+                    self._settings.STRATEGY_RUN_MODE != "independent"
+                    and sig.action != SignalAction.NONE
+                ):
+                    await self._handle_signal(
+                        sig,
+                        quote=quote,
+                        can_open=can_open,
+                        can_exit=can_exit,
+                        compliance_allow=compliance_decision.allow_new_entries,
+                        eligible=elig.eligible,
+                        eligibility_reason=elig.reason,
+                        eligibility_code=elig.code,
+                        bot_managed_notional=bot_managed_notional,
+                    )
+            elif self._settings.STRATEGY_RUN_MODE != "independent":
+                for signal in raw_all:
+                    if signal.strategy_name != primary:
+                        continue
+                    await self._handle_signal(
+                        signal,
+                        quote=quote,
+                        can_open=can_open,
+                        can_exit=can_exit,
+                        compliance_allow=compliance_decision.allow_new_entries,
+                        eligible=elig.eligible,
+                        eligibility_reason=elig.reason,
+                        eligibility_code=elig.code,
+                        bot_managed_notional=bot_managed_notional,
+                    )
 
         if self._market_clock is not None and not session.is_open and self._settings.DAILY_REPORT_ENABLED:
             det = today_eastern().strftime("%Y-%m-%d")
@@ -1113,7 +1239,10 @@ class Orchestrator:
                     dyn_path=resolve_dynamic_params_path(self._settings),
                 )
                 self._strategy_runtime_thr = thr
-                self._strategy.set_runtime_thresholds(thr)
+                for strat in self._strategies:
+                    setter = getattr(strat, "set_runtime_thresholds", None)
+                    if callable(setter):
+                        setter(thr)
                 enqueue_discord_alert(
                     self._discord_out,
                     {
@@ -1216,13 +1345,21 @@ class Orchestrator:
             extra_meta = {k: v for k, v in audit.items() if k not in meta_reserve}
             extra_meta["exit_price_source"] = exit_px_source
             extra_meta["entry_price_source"] = entry_px_source
+            # ML / analytics: persist how this row was produced so training can exclude
+            # dry-run or paper rows later (see README + .env ML_TRAINING_* comments).
+            extra_meta["execution_alpaca_env"] = str(self._settings.ALPACA_ENV)
+            extra_meta["execution_dry_run"] = 1 if self._settings.DRY_RUN else 0
+            extra_meta["execution_live_order_api"] = (
+                1 if self._settings.can_submit_real_orders else 0
+            )
             invalid_label = bool(exit_px_source != "broker_fill" or exit_px is None)
             data_quality_flags = {}
             if invalid_label:
                 data_quality_flags["degraded_exit_label"] = exit_px_source
                 extra_meta["invalid_for_ml"] = True
                 extra_meta["invalid_for_kelly"] = True
-            self._database.record_completed_trade(
+            trade_source = runtime_trade_source(self._settings)
+            row_id = self._database.record_completed_trade(
                 trade_id=None,
                 symbol=sym,
                 side="long",
@@ -1240,6 +1377,7 @@ class Orchestrator:
                 sentiment_label=audit.get("sentiment_label"),
                 is_canary=0,
                 metadata=extra_meta or None,
+                source=trade_source,
                 realized_return_pct=ret,
                 entry_notional=entry_px * qty if entry_px is not None else None,
                 exit_notional=exit_px * qty if exit_px is not None else None,
@@ -1249,6 +1387,17 @@ class Orchestrator:
                 invalid_for_ml=invalid_label,
                 invalid_for_kelly=invalid_label,
             )
+            if row_id is not None:
+                self._log.info(
+                    "event=completed_trade_persisted id=%s symbol=%s source=%s "
+                    "execution_alpaca_env=%s execution_dry_run=%s execution_live_order_api=%s",
+                    row_id,
+                    sym,
+                    trade_source,
+                    self._settings.ALPACA_ENV,
+                    str(self._settings.DRY_RUN).lower(),
+                    str(self._settings.can_submit_real_orders).lower(),
+                )
         except Exception as exc:  # noqa: BLE001
             self._log.warning(
                 "event=db_write_error kind=finalize_closed_trade symbol=%s err=%s",
@@ -2223,7 +2372,7 @@ class Orchestrator:
         self._refresh_symbol_bars(sym, force=True)
 
     def _fetch_symbol_bars(self, symbol: str) -> pd.DataFrame:
-        lookback = self._strategy.warmup_lookback()
+        lookback = max(int(s.warmup_lookback()) for s in self._strategies)
         return self._bar_fetcher.fetch_bars(
             symbol.upper(),
             self._settings.BAR_TIMEFRAME,
@@ -2234,7 +2383,7 @@ class Orchestrator:
         """Force a one-symbol backfill when the normal cache refresh returns no bars."""
 
         sym = symbol.upper()
-        lookback = max(200, int(self._strategy.warmup_lookback()))
+        lookback = max(200, max(int(s.warmup_lookback()) for s in self._strategies))
         self._log_strategy.warning(
             "event=data_recovery_start symbol=%s reason=bar_rows_0 timeframe=%s lookback_bars=%s",
             sym,

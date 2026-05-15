@@ -38,6 +38,8 @@ class Signal:
     reference_price: float = 0.0
     atr: float = 0.0
     metadata: dict = field(default_factory=dict)
+    strategy_name: Optional[str] = None
+    confidence: float = 1.0
 
 
 @dataclass
@@ -61,6 +63,8 @@ class StrategyContext:
     anti_martingale_risk_mode: Optional[str] = None
     anti_martingale_multiplier: Optional[float] = None
     recent_trade_outcomes_hint: str = ""
+    all_bars_by_symbol: dict[str, pd.DataFrame] = field(default_factory=dict)
+    all_quotes_by_symbol: dict[str, Quote] = field(default_factory=dict)
 
     @property
     def has_position(self) -> bool:
@@ -73,6 +77,21 @@ class StrategyContext:
     @property
     def position(self) -> Optional[PositionSnapshot]:
         return self.positions_by_symbol.get(self.symbol.upper())
+
+    def quote_age_vs_eval_seconds(self) -> Optional[float]:
+        """Seconds from quote timestamp to the evaluation clock (``now_utc``).
+
+        Live ticks set ``now_utc`` to the orchestrator's evaluation instant; replay
+        sets it to the simulated bar time while the synthetic quote is stamped with
+        that same bar. Using this for staleness keeps real-time freshness checks
+        meaningful without treating historical replay quotes as wall-clock stale.
+        """
+        if self.quote is None:
+            return None
+        try:
+            return float(self.quote.age_seconds(reference=self.now_utc))
+        except (AttributeError, TypeError, ValueError):
+            return None
 
 
 class Strategy(ABC):

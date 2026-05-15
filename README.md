@@ -29,6 +29,55 @@ GitHub repository: <https://github.com/vardaan112/tradingbot>
 
 ## Architecture
 
+Reference flows below match the **sim** layer (`src/sim/`), **shadow** hooks in
+`orchestrator.py`, and the **broker** path (`WeightedEnsembleEngine` → sizing →
+`OrderService`). The directory tree lists where each piece lives.
+
+### Reference: Historical replay
+
+Bars are fetched from Alpaca market data; no live order APIs. Replay **mode**
+selects which simulated books run (`independent`, `ensemble`, or `both`).
+
+```mermaid
+flowchart TD
+  A[Historical bars / quotes] --> B[StrategyEngine]
+  B --> C[Raw strategy signals]
+  C --> D{Replay mode}
+  D -->|independent / both| E[Independent simulated portfolios]
+  D -->|ensemble / both| F[Weighted ensemble simulated portfolio]
+  E --> G[SQLite + CSV + dashboard]
+  F --> G
+```
+
+### Reference: Live shadow
+
+Virtual fills per strategy; **no** `OrderService` broker posts. Requires
+`SHADOW_TRADING_ENABLED` and multiple active strategies (see Research workflow).
+
+```mermaid
+flowchart TD
+  A[Live Alpaca data] --> B[StrategyEngine]
+  B --> C[Raw strategy signals]
+  C --> D[Shadow portfolios only]
+  D --> E[SQLite + dashboard]
+```
+
+### Reference: Live / paper ensemble (broker path)
+
+Same streaming path as single-strategy mode; ensemble collapses to **one**
+action per symbol before sizing and orders.
+
+```mermaid
+flowchart TD
+  A[Live Alpaca data] --> B[StrategyEngine]
+  B --> C[WeightedEnsembleEngine]
+  C --> D[One final signal per symbol]
+  D --> E[Existing risk / compliance / exposure / sizing]
+  E --> F[OrderService]
+```
+
+### Repository layout
+
 ```
 src/
   main.py                          entry point
@@ -45,6 +94,8 @@ src/
     market_data.py                 quote cache + historical bar fetcher
     trading_stream.py              supervised websocket runner
     orders.py                      limit-only orders + reconciliation
+    database.py                    SQLite persistence + ML/Kelly source filters
+    trade_source.py                runtime ``source`` label from Settings (live/paper/dry_run)
     account.py                     account/position adapters (PDT-tolerant)
     market_clock.py                market hours guard
     retries.py                     exp-backoff retries (429-aware)
@@ -64,9 +115,15 @@ src/
     rsi_mean_reversion.py          backward-compat re-export of rsi_strategy
   services/
     orchestrator.py                top-level event loop
+    ensemble.py                    weighted ensemble decisions
+    shadow_portfolio.py            live shadow virtual portfolios (no orders)
+    performance_weights.py         optional performance-based ensemble weights
     heartbeat.py                   60s heartbeat task
     canary.py                      one-time live canary check at startup
-  utils/                           ids, math, price, time helpers (+ offline `backtester`)
+  sim/
+    replay.py                      CLI: python -m sim.replay (replay-bot)
+    replay_engine.py               multi-strategy historical replay + SQLite
+  utils/                           ids, math, price, time helpers; backtester; **dashboard.py**
 runtime/                           persistent state (gitignored)
 logs/                              rotating log files (gitignored)
 tests/                             unit tests (run offline, no network)
@@ -104,12 +161,117 @@ pip install discord.py scikit-learn xgboost psutil python-dotenv alpaca-py
 
 ---
 
+## Research workflow & rollout
+
+See **Architecture** (reference diagrams above) for how replay, shadow, and
+ensemble broker paths differ. Typical path: **offline replay → dashboard review → live shadow (no orders) →
+ensemble on paper → live only with explicit gates.** Backtests and replay rows
+are **not** guarantees of future live performance.
+
+### Default: single-strategy RSI dry-run (unchanged)
+
+Keep `ACTIVE_STRATEGIES=rsi_mean_reversion`, `STRATEGY_RUN_MODE=single`, and
+`DRY_RUN=true` for the original safe loop:
+
+```bash
+python src/main.py
+```
+
+### Run a 14-day multi-strategy replay
+
+Install editable so CLI scripts resolve (`pip install -e .`), then:
+
+```bash
+replay-bot \
+  --lookback-days 14 \
+  --symbols SPY,QQQ,IWM,XLF,EEM \
+  --strategies rsi_mean_reversion,momentum,breakout,vwap_pullback \
+  --mode both \
+  --initial-equity 10000 \
+  --timeframe 5Min \
+  --database ./runtime/replay.sqlite3
+```
+
+Same entry point as:
+
+```bash
+python -m sim.replay --lookback-days 14 --symbols SPY --strategies rsi_mean_reversion,momentum \
+  --mode independent --initial-equity 100000 --timeframe 5Min --database ./runtime/replay.sqlite3
+```
+
+Use **`--start`** and **`--end`** (ISO UTC) **instead of** `--lookback-days` for a
+fixed window (do not pass `--start` together with `--lookback-days`). Enable
+strategy feature flags in `.env` when needed (`MOMENTUM_ENABLED`, `BREAKOUT_ENABLED`,
+`VWAP_PULLBACK_ENABLED`, …).
+
+### Compare strategies (replay `--mode`)
+
+| Mode            | Behaviour |
+|-----------------|-----------|
+| `independent`   | One simulated portfolio per strategy |
+| `ensemble`      | One weighted ensemble portfolio |
+| `both`          | Independent portfolios **and** ensemble |
+
+Outputs: `LOG_DIR/replay_runs/<run_id>/` (CSV + Markdown). With `--database`,
+SQLite rows use `source=replay` for the dashboard.
+
+### Dashboard
+
+```bash
+streamlit run src/utils/dashboard.py
+```
+
+Sidebar: pick a **replay run** and adjust **source** scope (`replay`, `shadow`,
+`live`, …). Ensemble **performance-weight** snapshots appear when that mode is
+enabled.
+
+### Live shadow mode (no broker orders)
+
+```env
+ACTIVE_STRATEGIES=rsi_mean_reversion,momentum,breakout,vwap_pullback
+STRATEGY_WEIGHTS_JSON={"rsi_mean_reversion":0.25,"momentum":0.25,"breakout":0.25,"vwap_pullback":0.25}
+STRATEGY_RUN_MODE=independent
+SHADOW_TRADING_ENABLED=true
+LIVE_TRADING_ENABLED=false
+DRY_RUN=true
+```
+
+Shadow books require **two or more** active strategies. SQLite uses `source=shadow`.
+
+### Ensemble on Alpaca paper
+
+```env
+ACTIVE_STRATEGIES=rsi_mean_reversion,momentum,breakout,vwap_pullback
+STRATEGY_WEIGHTS_JSON={"rsi_mean_reversion":0.25,"momentum":0.25,"breakout":0.25,"vwap_pullback":0.25}
+STRATEGY_RUN_MODE=ensemble
+ENSEMBLE_ENABLED=true
+ALPACA_ENV=paper
+LIVE_TRADING_ENABLED=true
+DRY_RUN=false
+```
+
+Orders still flow through risk, compliance, exposure, and `OrderService`. Start
+with a small **`MAX_EQUITY_USAGE_USD`**.
+
+### Before live deployment
+
+1. **`pytest`** (and CI subsets) green.  
+2. Long **shadow** + **paper ensemble** observation.  
+3. **Live** needs `ALPACA_ENV=live`, `LIVE_TRADING_ENABLED=true`, `DRY_RUN=false`,
+   **`CONFIRM_LIVE_TRADING=yes_i_understand`**, and **`BLOCK_LIVE_DEPLOYMENT=false`**
+   (keep `BLOCK_LIVE_DEPLOYMENT=true` until you deliberately clear it for a live rollout).  
+4. Keep **`MAX_EQUITY_USAGE_USD`** at the default cap until you deliberately raise it.
+
+Copy **`.env.example`** → `.env` and replace placeholders (never commit `.env`).
+
+---
+
 ## Pre-flight checklist
 
 1. Install dependencies: `pip install -r requirements.txt`
-2. Ensure `.env` exists and contains Alpaca keys, Discord token / `DISCORD_CHANNEL_ID` / `DISCORD_ALLOWED_USER_IDS` when Discord is enabled, and an explicit `DRY_RUN` setting.
+2. Copy **`.env.example`** to `.env` and fill in Alpaca keys, Discord fields when Discord is enabled, and an explicit `DRY_RUN` setting.
 3. Run offline tests: `pytest`
-4. Start in dry-run first: `DRY_RUN=true python main.py`
+4. Start in dry-run first: `DRY_RUN=true python src/main.py`
 5. Confirm Discord shows the startup banner (with clear `DRY_RUN` truth) and `SIMULATED FILL` notifications if you exercised entries in dry-run.
 6. Only then, deliberately set `DRY_RUN=false` when you intend real orders.
 
@@ -118,6 +280,8 @@ Never run `DRY_RUN=false` unless you have verified Discord alerts (unless you ex
 ---
 
 ## Environment configuration (.env)
+
+Template without secrets: **`.env.example`** (copy to `.env`).
 
 Runtime configuration is kept in `.env`. The most important keys:
 
@@ -129,6 +293,7 @@ Runtime configuration is kept in `.env`. The most important keys:
 | `LIVE_TRADING_ENABLED`           | `false`        | Master gate to send orders |
 | `DRY_RUN`                        | `true`         | Do not POST orders even if enabled |
 | `CONFIRM_LIVE_TRADING`           | empty          | Must equal `yes_i_understand` to enable live trading on the live endpoint |
+| `BLOCK_LIVE_DEPLOYMENT`          | `true`         | Advisory guard; set `false` only when intentionally going to live with all other checks satisfied |
 | `MAX_EQUITY_USAGE_USD`           | `50`           | Hard USD cap on bot-managed exposure |
 | `MAX_RISK_PER_TRADE_PCT`         | `0.01`         | 1% of capital base per trade (hard ceiling) |
 | `BOT_CAPITAL_BASE_USD`           | `0`            | Bot's allocated capital slice in USD. When >0, risk is computed against this instead of full account equity. 0 = fall back to `min(equity, MAX_EQUITY_USAGE_USD)` |
@@ -497,6 +662,8 @@ pip install -e .[dev]
 pytest
 ```
 
+Use **`pip install -e .[dev]`** before `pytest`: the full suite includes async tests that need **`pytest-asyncio`** (declared under `[project.optional-dependencies]` `dev`). Installing only `pip install -e .` leaves those tests unable to run.
+
 The test suite never touches the Alpaca API.
 
 ---
@@ -605,9 +772,28 @@ the public internet.
 - **Live warning badge** when `ALPACA_ENV=live` and `DRY_RUN=false`.
 
 Replayed SQLite rows (**simulation**) can be blended via the sidebar scope filter (**live** /
-**simulation** / **all**) for daily realized totals sourced from `completed_trades`.
+**simulation** / **all**) for daily realized totals sourced from `completed_trades`. The **live**
+scope includes only ``source`` in ``live`` or ``paper`` (broker path); **all** includes
+``dry_run``, ``replay``, ``shadow``, and other labels when present.
 
 If a data source fails, that section degrades gracefully while the rest keeps working.
+
+---
+
+## SQLite `completed_trades.source` labels
+
+The bot persists a ``source`` string on each completed trade and on execution-event rows (Phase 0) so reporting, Kelly, ML, and dashboards never mix environments:
+
+| `source` | When it is used |
+|----------|-----------------|
+| `live` | Alpaca **live** endpoint and ``DRY_RUN=false`` (real broker orders / fills). |
+| `paper` | Alpaca **paper** endpoint and ``DRY_RUN=false``. |
+| `dry_run` | ``DRY_RUN=true`` (simulated fills; no order POST), including on paper keys. |
+| `simulation` | ``scripts/replay_simulator.py`` / legacy backtest CSV replay into SQLite. |
+| `replay` | ``sim.replay`` / ``HistoricalReplayEngine`` bar-walk replay into SQLite (`source=replay`). |
+| `shadow` | Live shadow virtual portfolios (`shadow_portfolio.py`); no broker order POST. |
+
+Default **ML** and **Kelly** SQLite queries only include rows with ``source`` in ``live`` or ``paper`` unless callers pass ``exclude_simulation=False`` (legacy name: when false, no source filter is applied).
 
 ---
 

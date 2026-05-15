@@ -188,3 +188,28 @@ def test_emergency_flatten_short_constructs_above_ask():
     raw = quote.ask + aggressiveness_pct * mid
     rounded = round_to_tick(raw, mode="up")
     assert rounded >= quote.ask
+
+
+def test_strategy_context_quote_age_vs_eval_seconds_aligns_replay_clock():
+    """Historical replay stamps quotes at bar time; age vs ``now_utc`` must be ~0."""
+    bar_ts = datetime(2026, 1, 5, 16, 0, tzinfo=timezone.utc)
+    q = Quote(
+        symbol="SPY",
+        bid=99.0,
+        ask=101.0,
+        bid_size=1.0,
+        ask_size=1.0,
+        timestamp=bar_ts,
+        feed="replay",
+    )
+    ctx = StrategyContext(
+        symbol="SPY",
+        bars=pd.DataFrame(),
+        quote=q,
+        account=_make_account(),
+        positions_by_symbol={},
+        open_order_symbols=set(),
+        now_utc=bar_ts,
+        feed="replay",
+    )
+    assert ctx.quote_age_vs_eval_seconds() == 0.0

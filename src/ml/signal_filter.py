@@ -22,6 +22,45 @@ _LOG = logging.getLogger(LOGGER_STRATEGY)
 REGIME_ENCODE = {"Range": 0.0, "Trending": 1.0, "": 0.0}
 
 
+def log_ml_training_row_execution_mix(rows: list[dict[str, Any]], *, log: logging.Logger) -> None:
+    """Summarize persisted ``execution_*`` metadata for training-set hygiene."""
+
+    n = len(rows)
+    paper = live = env_missing = 0
+    dry = not_dry = dry_missing = 0
+    for r in rows:
+        md = r.get("metadata")
+        if not isinstance(md, dict):
+            env_missing += 1
+            dry_missing += 1
+            continue
+        env = md.get("execution_alpaca_env")
+        if env == "paper":
+            paper += 1
+        elif env == "live":
+            live += 1
+        else:
+            env_missing += 1
+        dr = md.get("execution_dry_run")
+        if dr in (1, True):
+            dry += 1
+        elif dr in (0, False):
+            not_dry += 1
+        else:
+            dry_missing += 1
+    log.info(
+        "event=ml_training_execution_mix rows=%s alpaca_env_paper=%s alpaca_env_live=%s "
+        "alpaca_env_missing=%s dry_run_yes=%s dry_run_no=%s dry_run_missing=%s",
+        n,
+        paper,
+        live,
+        env_missing,
+        dry,
+        not_dry,
+        dry_missing,
+    )
+
+
 def _symbol_encoding(symbol: str) -> float:
     raw = str(symbol or "UNK").strip().upper().encode("utf-8")
     return float(zlib.crc32(raw) & 0xFFFF) / 65535.0
@@ -161,6 +200,7 @@ class MLSignalFilter:
             limit=int(self._settings.ML_MAX_TRAINING_TRADES),
             exclude_simulation=True,
         )
+        log_ml_training_row_execution_mix(rows, log=_LOG)
         recent_n = min(len(rows), int(self._settings.ML_INFERENCE_RECENT_CONTEXT))
 
         min_n = int(self._settings.MIN_ML_TRAINING_TRADES)

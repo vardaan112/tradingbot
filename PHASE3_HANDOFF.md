@@ -1,5 +1,9 @@
 # Phase 3 Handoff — Trading Bot Improvements
 
+> **Phase 9 note:** This document is **historical backlog** (Phase 3 QoL). For current
+> operator runbooks — multi-strategy replay, shadow mode, ensemble paper, live
+> confirmation gates — see **README.md** → *Research workflow & rollout*.
+
 **Branch to base off:** `main` (Phase 1+2 already merged via `fix/phase1-phase2-critical-bugs`)  
 **Repo:** `vardaan112/tradingbot`  
 **Date written:** 2026-05-09

@@ -37,6 +37,7 @@ def reconcile_bot_ledger(
         db=None,
         strategy_name="",
         emit_position_adopted_log=emit_position_adopted,
+        execution_event_source=None,
     )
     return _ledger
 
@@ -51,6 +52,7 @@ def reconcile_open_positions(
     strategy_name: str = "strategy",
     eps_qty: float = 0.05,
     eps_avg_rel: float = 0.001,
+    execution_event_source: Optional[str] = None,
 ) -> RecoverySummary:
     """Rebuild ledger from Alpaca holdings; log ``state_recovery`` for true orphans."""
 
@@ -65,6 +67,7 @@ def reconcile_open_positions(
         db=db,
         strategy_name=strategy_name,
         emit_position_adopted_log=True,
+        execution_event_source=execution_event_source,
     )
     return summary
 
@@ -81,6 +84,7 @@ def _reconcile_impl(
     db: Optional["Database"],
     strategy_name: str,
     emit_position_adopted_log: bool,
+    execution_event_source: Optional[str] = None,
 ) -> tuple[dict[str, BotManagedPosition], RecoverySummary]:
     prev = state.load_bot_ledger()
     ledger: dict[str, BotManagedPosition] = {}
@@ -142,6 +146,7 @@ def _reconcile_impl(
                             "strategy": strategy_name,
                             "reason": "orphan_broker_position",
                         },
+                        source=execution_event_source or "live",
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("event=db_write_error kind=state_recovery symbol=%s err=%s", sym, exc)

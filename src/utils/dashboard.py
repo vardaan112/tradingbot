@@ -4,6 +4,10 @@ Run from the repository root (same ``.env`` as the bot)::
 
     streamlit run src/utils/dashboard.py
 
+Phase 5 tabs: Overview, Live / Paper, replay analytics, trades, symbol drilldown,
+signals/skips, ensemble decisions. Pure SQL/pandas loaders live in
+``utils.dashboard_helpers`` (imported here for the UI).
+
 Uses ``get_settings()`` from ``config.settings``, SQLite (read-only URI),
 ``logs/app.log``, ``runtime/kill_switch_state.json``, Alpaca **market data**
 (bars + latest quotes for the Live Watchlist), and ``TradingClient``
@@ -46,6 +50,23 @@ except ImportError:
     st_autorefresh = None  # type: ignore[misc, assignment]
 
 from config.settings import Settings, get_settings  # noqa: E402
+from utils.dashboard_helpers import (  # noqa: E402
+    _PNL_COLUMN_CANDIDATES,
+    _TIME_COLUMN_CANDIDATES,
+    _first_matching_column,
+    _table_columns,
+    build_replay_runs_summary_table,
+    build_strategy_comparison_table,
+    compute_trade_performance,
+    connect_sqlite_readonly,
+    discover_trade_table,
+    load_completed_trades_by_run,
+    load_equity_snapshots,
+    load_replay_runs,
+    load_skip_events,
+    load_strategy_decisions,
+    load_strategy_signals,
+)
 
 # ---------------------------------------------------------------------------
 # Pure helpers (safe to import from tests without running Streamlit UI)
@@ -53,9 +74,64 @@ from config.settings import Settings, get_settings  # noqa: E402
 
 LatencyStatus = Literal["ok", "warn", "fail", "unknown"]
 
-_TRADE_TABLE_CANDIDATES = ("completed_trades", "trades", "executions")
-_PNL_COLUMN_CANDIDATES = ("net_pnl", "realized_pnl", "pnl", "profit_loss")
-_TIME_COLUMN_CANDIDATES = ("closed_at", "exit_time", "closed_time", "timestamp", "created_at")
+
+def render_ensemble_performance_weights_sidebar(settings: Settings, resolved_db: Path) -> None:
+    """Show current ensemble weight mode and latest performance-weight snapshot (read-only)."""
+
+    st.sidebar.markdown("**Ensemble weights (Phase 8)**")
+    st.sidebar.write(f"- `ENSEMBLE_WEIGHT_MODE`: **{settings.ENSEMBLE_WEIGHT_MODE}**")
+    st.sidebar.write(
+        f"- Performance source: **`{settings.ENSEMBLE_PERFORMANCE_SOURCE}`** "
+        f"(lookback **{settings.ENSEMBLE_PERFORMANCE_LOOKBACK_DAYS}d**, "
+        f"min trades **{settings.ENSEMBLE_MIN_TRADES_FOR_WEIGHT}**)",
+    )
+    st.sidebar.caption(
+        f"`ALLOW_LIVE_PERFORMANCE_WEIGHTS` = **{settings.ALLOW_LIVE_PERFORMANCE_WEIGHTS}** · "
+        f"smoothing α **{settings.ENSEMBLE_WEIGHT_SMOOTHING_ALPHA}**",
+    )
+    if not resolved_db.is_file():
+        st.sidebar.info("SQLite DB missing — no weight snapshots.")
+        return
+    try:
+        from core.database import Database
+    except Exception:
+        st.sidebar.caption("Could not import `Database` for weight history.")
+        return
+    db = Database(resolved_db)
+    rows = db.query_strategy_decisions(decision_type="ensemble_performance_weights", limit=5)
+    if not rows:
+        if settings.ENSEMBLE_WEIGHT_MODE == "static":
+            st.sidebar.caption("Using **static** JSON weights (no performance snapshots).")
+        else:
+            st.sidebar.warning(
+                "No `ensemble_performance_weights` rows yet — thin data, first run, "
+                "or performance source has no trades.",
+            )
+        return
+    r = rows[0]
+    ts = str(r["timestamp"] if "timestamp" in r.keys() else "")
+    st.sidebar.caption(f"Latest snapshot: `{ts}`")
+    meta_raw = r["metadata_json"] if "metadata_json" in r.keys() else None
+    try:
+        meta = json.loads(meta_raw) if meta_raw else {}
+    except json.JSONDecodeError:
+        meta = {}
+    if meta.get("fallback_reason"):
+        st.sidebar.warning(f"Fallback: **{meta['fallback_reason']}**")
+    if meta.get("used_performance") is False:
+        st.sidebar.info("Last run used **static** weights (fallback).")
+    weights = meta.get("weights")
+    if isinstance(weights, dict) and weights:
+        st.sidebar.markdown("*Active weights*")
+        st.sidebar.write(weights)
+    metrics = meta.get("metrics")
+    if isinstance(metrics, dict) and metrics:
+        with st.sidebar.expander("Metrics used for scoring"):
+            st.json(metrics)
+    scores = meta.get("scores")
+    if isinstance(scores, dict) and scores:
+        with st.sidebar.expander("Raw scores (pre-softmax)"):
+            st.json(scores)
 
 
 @dataclass(frozen=True)
@@ -163,33 +239,46 @@ def tail_last_lines(
         return []
 
 
-def connect_sqlite_readonly(db_path: Path) -> Optional[sqlite3.Connection]:
-    """Open SQLite in read-only mode (no WAL side effects)."""
 
-    try:
-        path = db_path.expanduser().resolve()
-        if not path.exists():
-            return None
-        uri = f"file:{path}?mode=ro"
-        return sqlite3.connect(uri, uri=True, check_same_thread=False)
-    except sqlite3.Error:
+def discover_replay_output_dir(settings: Settings, run_id: str) -> Optional[Path]:
+    """Directory for replay CSV artifacts under ``LOG_DIR/replay_runs`` or ``REPORTS_DIR/replay``.
+
+    Prefers ``<run_id>/`` for older runs; otherwise scans subfolders for ``config.json``
+    whose ``run_id`` field matches (supports descriptive folder names).
+    """
+
+    rid = (run_id or "").strip()
+    if not rid:
         return None
-
-
-def discover_trade_table(conn: sqlite3.Connection) -> Optional[str]:
-    """Pick ``completed_trades`` if present, else ``trades`` / ``executions``."""
-
-    try:
-        rows = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-        ).fetchall()
-    except sqlite3.Error:
-        return None
-    names = {str(r[0]).lower(): str(r[0]) for r in rows}
-    for cand in _TRADE_TABLE_CANDIDATES:
-        if cand in names:
-            return names[cand]
+    raw_log = Path(settings.LOG_DIR)
+    log_dir = raw_log.expanduser().resolve() if raw_log.is_absolute() else (Path.cwd() / raw_log).expanduser().resolve()
+    raw_rep = Path(settings.REPORTS_DIR)
+    rep_dir = raw_rep.expanduser().resolve() if raw_rep.is_absolute() else (Path.cwd() / raw_rep).expanduser().resolve()
+    for base in (log_dir / "replay_runs", rep_dir / "replay"):
+        legacy = base / rid
+        if legacy.is_dir():
+            return legacy
+        if not base.is_dir():
+            continue
+        for child in sorted(base.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if not child.is_dir():
+                continue
+            cfg = child / "config.json"
+            if not cfg.is_file():
+                continue
+            try:
+                data = json.loads(cfg.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if str(data.get("run_id") or "") == rid:
+                return child
     return None
+
+
+def discover_replay_equity_csvs(run_dir: Path) -> list[Path]:
+    if not run_dir.is_dir():
+        return []
+    return sorted(run_dir.glob("equity__*.csv"))
 
 
 def query_today_trades(
@@ -198,6 +287,14 @@ def query_today_trades(
     *,
     source_scope: str = "live",
 ) -> list[TodayTradeRow]:
+    """Return completed trades for an ET calendar day.
+
+    ``source_scope``:
+    - ``live``: ``source`` in ``live`` or ``paper`` (Alpaca broker path only;
+      excludes ``dry_run``, ``replay``, ``shadow``, ``simulation``).
+    - ``simulation``: ``source == 'simulation'`` (CSV replay / legacy backtest rows).
+    - ``all``: no ``source`` filter.
+    """
     start = f"{trading_day_yyyy_mm_dd}T00:00:00"
     end = f"{trading_day_yyyy_mm_dd}T23:59:59"
     src_clause = ""
@@ -240,6 +337,7 @@ def query_recent_pnl_and_risk(
     limit: int = 24,
     source_scope: str = "live",
 ) -> list[tuple[Optional[float], Optional[str]]]:
+    """Recent ``realized_pnl`` + ``risk_mode`` rows; ``source_scope`` matches ``query_today_trades``."""
     src_clause = ""
     if source_scope == "simulation":
         src_clause = " AND COALESCE(source, 'live') = 'simulation' "
@@ -286,21 +384,6 @@ def query_latest_canary(conn: sqlite3.Connection) -> tuple[Optional[bool], Optio
     ok = bool(int(row[0])) if row[0] is not None else False
     err = str(row[1]) if row[1] else None
     return ok, err
-
-
-def _table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
-    try:
-        rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
-        return [str(r[1]) for r in rows]
-    except sqlite3.Error:
-        return []
-
-
-def _first_matching_column(cols_lower: dict[str, str], candidates: tuple[str, ...]) -> Optional[str]:
-    for c in candidates:
-        if c.lower() in cols_lower:
-            return cols_lower[c.lower()]
-    return None
 
 
 def load_trades_dataframe_schema_tolerant(
@@ -350,49 +433,6 @@ def load_trades_dataframe_schema_tolerant(
     df = df.rename(columns={pnl_col: "_pnl", time_col: "_ts"})
     df["_pnl"] = pd.to_numeric(df["_pnl"], errors="coerce").fillna(0.0)
     return df, table, "_pnl", "_ts"
-
-
-def compute_trade_performance(df: pd.DataFrame, *, pnl_key: str = "_pnl") -> dict[str, Any]:
-    """Aggregate metrics from a trade frame with canonical ``_pnl`` column."""
-
-    if df.empty or pnl_key not in df.columns:
-        return {
-            "total_realized": 0.0,
-            "win_rate": 0.0,
-            "profit_factor": None,
-            "profit_factor_label": "N/A",
-            "avg_trade": 0.0,
-            "n_trades": 0,
-            "best": 0.0,
-            "worst": 0.0,
-        }
-
-    pnl = df[pnl_key].astype(float)
-    wins = pnl[pnl > 1e-9]
-    losses = pnl[pnl < -1e-9]
-    n = len(pnl)
-    nw, nl = len(wins), len(losses)
-    win_rate = nw / max(1, nw + nl)
-    gp = float(wins.sum()) if nw else 0.0
-    gl_abs = float(losses.abs().sum()) if nl else 0.0
-
-    if gl_abs < 1e-12:
-        pf_label = "∞" if gp > 1e-12 else "N/A"
-        pf_val: Optional[float] = None if nl == 0 else float("inf")
-    else:
-        pf_val = gp / gl_abs
-        pf_label = f"{pf_val:.4f}"
-
-    return {
-        "total_realized": float(pnl.sum()),
-        "win_rate": win_rate,
-        "profit_factor": pf_val,
-        "profit_factor_label": pf_label,
-        "avg_trade": float(pnl.mean()) if n else 0.0,
-        "n_trades": n,
-        "best": float(pnl.max()) if n else 0.0,
-        "worst": float(pnl.min()) if n else 0.0,
-    }
 
 
 # Default ETF basket when ``SYMBOLS`` is empty.
@@ -868,6 +908,630 @@ def _inject_theme_css() -> None:
     )
 
 
+def render_alpaca_account_cards(
+    *,
+    equity: Optional[float],
+    cash: Optional[float],
+    bp: Optional[float],
+    open_unreal_f: Optional[float],
+    daily_realized: Optional[float],
+    metrics: dict[str, Any],
+) -> None:
+    """Eight summary tiles (Alpaca + SQLite aggregates) for the Live / Paper tab."""
+
+    mc = metrics
+    mcols = st.columns(8)
+
+    def _metric(idx: int, label: str, value: str, *, profit: bool | None = None) -> None:
+        with mcols[idx]:
+            if profit is True:
+                st.markdown(
+                    f'<div class="cc-card profit"><div style="font-size:12px;color:#94a3b8;">{label}</div>'
+                    f'<div style="font-size:22px;font-weight:700;">{value}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            elif profit is False:
+                st.markdown(
+                    f'<div class="cc-card loss"><div style="font-size:12px;color:#94a3b8;">{label}</div>'
+                    f'<div style="font-size:22px;font-weight:700;">{value}</div></div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div class="cc-card"><div style="font-size:12px;color:#94a3b8;">{label}</div>'
+                    f'<div style="font-size:22px;font-weight:700;">{value}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+    eq_s = f"{equity:,.2f}" if equity is not None else "—"
+    cash_s = f"{cash:,.2f}" if cash is not None else "—"
+    bp_s = f"{bp:,.2f}" if bp is not None else "—"
+    ou = open_unreal_f
+    ou_s = f"{ou:,.2f}" if ou is not None else "—"
+    dr = daily_realized
+    dr_s = f"{dr:,.2f}" if dr is not None else "—"
+    wr = f"{float(mc.get('win_rate', 0)) * 100:.1f}%" if mc.get("n_trades", 0) else "—"
+    pf = str(mc.get("profit_factor_label", "N/A"))
+    at = f"{float(mc.get('avg_trade', 0)):,.2f}" if mc.get("n_trades", 0) else "—"
+    tr_db = float(mc.get("total_realized", 0.0))
+    tr_s = f"{tr_db:,.2f}" if mc.get("n_trades", 0) else "—"
+
+    pr_open = None if ou is None else (True if ou > 1e-6 else (False if ou < -1e-6 else None))
+    pr_day = None if dr is None else (True if dr > 1e-6 else (False if dr < -1e-6 else None))
+
+    _metric(0, "Total equity", eq_s)
+    _metric(1, "Buying power", bp_s)
+    _metric(2, "Cash", cash_s)
+    _metric(3, "Unrealized P/L (open)", ou_s, profit=pr_open)
+    _metric(4, "Realized P/L (today)", dr_s, profit=pr_day)
+    _metric(5, "Win rate (DB)", wr)
+    _metric(6, "Profit factor", pf)
+    _metric(7, "Avg trade (DB)", at)
+    st.caption(f"All-time realized P/L (SQLite trade history): **{tr_s}**")
+
+
+def render_dashboard_phase5_tabs(
+    *,
+    settings: Settings,
+    resolved_db: Path,
+    selected_replay_run: Optional[str],
+    env_label: str,
+    dry_txt: str,
+    ks_display: str,
+    metrics: dict[str, Any],
+    equity: Optional[float],
+    cash: Optional[float],
+    bp: Optional[float],
+    open_unreal_f: Optional[float],
+    daily_realized: Optional[float],
+    hist_df: pd.DataFrame,
+    db_pack: dict[str, Any],
+    pos_payload: dict[str, Any],
+    app_log_path: Path,
+    refresh_seconds: int,
+    go: Any,
+) -> None:
+    """Replay + analytics tabs (read-only)."""
+
+    pos_rows = pos_payload.get("positions") or []
+    tab_ov, tab_ac, tab_rr, tab_sc, tab_eq, tab_tr, tab_sym, tab_sig, tab_ens = st.tabs(
+        [
+            "Overview",
+            "Live / Paper",
+            "Replay Runs",
+            "Strategy Comparison",
+            "Equity & Drawdown",
+            "Trades",
+            "Symbol Drilldown",
+            "Signals & Skips",
+            "Ensemble Decisions",
+        ],
+    )
+
+    with tab_ov:
+        st.markdown(f"### Kill switch: {ks_display}")
+        st.caption(
+            f"Alpaca **{env_label}** · `DRY_RUN` **{dry_txt}** · "
+            f"Active strategies: `{settings.ACTIVE_STRATEGIES.strip() or '—'}`",
+        )
+        runs_latest = load_replay_runs(str(resolved_db), limit=1)
+        summ = build_replay_runs_summary_table(resolved_db, runs_latest)
+        if not summ.empty:
+            st.markdown("**Latest replay run (summary)**")
+            st.dataframe(summ, width="stretch", hide_index=True)
+            with st.expander("Raw `replay_runs` row"):
+                st.dataframe(runs_latest, width="stretch", hide_index=True)
+        elif not runs_latest.empty:
+            st.markdown("**Latest replay run**")
+            st.dataframe(runs_latest, width="stretch", hide_index=True)
+        else:
+            st.info("No rows in `replay_runs` (replay DB tables missing or empty).")
+
+        st.markdown("---")
+        st.subheader("Live Watchlist")
+        syms_wl = tuple(watchlist_symbols(settings))
+        wl_rows, wl_err = fetch_watchlist_rows(
+            syms_wl,
+            int(settings.RSI_LENGTH),
+            float(settings.RSI_OVERSOLD),
+            70.0,
+        )
+        st.caption(
+            f"5-minute bars · RSI length **{settings.RSI_LENGTH}** · "
+            f"signals: **below {settings.RSI_OVERSOLD:.0f}** = Oversold, **above 70** = Overbought · "
+            f"{', '.join(syms_wl)}",
+        )
+        if wl_err:
+            st.warning(f"Live Watchlist unavailable: {wl_err}")
+        elif wl_rows:
+            st.dataframe(pd.DataFrame(wl_rows), width="stretch", hide_index=True)
+        else:
+            st.info("No watchlist rows.")
+
+        st.caption(
+            "Watchlist data updates automatically. This dashboard is read-only and does not place trades.",
+        )
+
+        st.markdown("---")
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.subheader("Cumulative Realized P/L")
+            if go is not None and not hist_df.empty and "_ts" in hist_df.columns and "_pnl" in hist_df.columns:
+                h2 = hist_df.sort_values("_ts")
+                cum = h2["_pnl"].cumsum()
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Scatter(
+                        x=h2["_ts"],
+                        y=cum,
+                        mode="lines",
+                        line=dict(color="#4ade80", width=2),
+                        fill="tozeroy",
+                        fillcolor="rgba(74,222,128,0.12)",
+                    ),
+                )
+                fig.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(20,24,30,0.9)",
+                    margin=dict(l=40, r=20, t=40, b=40),
+                    height=360,
+                    xaxis_title="Time",
+                    yaxis_title="Cumulative P/L",
+                )
+                st.plotly_chart(fig, width="stretch")
+            elif hist_df.empty:
+                st.info("No trade history in SQLite for cumulative P/L.")
+            else:
+                st.warning("Install **plotly** for the equity curve chart: `pip install plotly`.")
+
+        with c2:
+            st.subheader("Quick snapshot")
+            st.write(f"- **Equity** (Alpaca): `{equity:,.2f}`" if equity is not None else "- **Equity**: —")
+            st.write(f"- **Cash**: `{cash:,.2f}`" if cash is not None else "- **Cash**: —")
+            st.write(f"- **Buying power**: `{bp:,.2f}`" if bp is not None else "- **Buying power**: —")
+            ou = open_unreal_f
+            st.write(f"- **Unrealized P/L** (open): `{ou:,.2f}`" if ou is not None else "- **Unrealized P/L**: —")
+            dr = daily_realized
+            st.write(f"- **Realized P/L** (today ET, DB scope): `{dr:,.2f}`" if dr is not None else "- **Daily realized**: —")
+
+        daily_df = db_pack.get("daily")
+        if isinstance(daily_df, pd.DataFrame) and not daily_df.empty and go is not None:
+            st.subheader("Daily Realized P/L (SQLite)")
+            figd = go.Figure(
+                data=[go.Bar(x=daily_df["day"].astype(str), y=daily_df["realized_pnl"], marker_color="#60a5fa")],
+            )
+            figd.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(20,24,30,0.9)",
+                height=300,
+                margin=dict(l=40, r=20, t=30, b=40),
+            )
+            st.plotly_chart(figd, width="stretch")
+
+        st.subheader("Log monitor (`app.log`, last 50 lines)")
+        log_lines = tail_last_lines(app_log_path, max_lines=50)
+        if log_lines:
+            st.code("\n".join(log_lines), language="")
+        else:
+            st.caption("Log file missing or empty.")
+
+        st.caption(
+            "Read-only Command Center · no orders · no DB writes · no kill-switch mutations. "
+            f"Account/positions cache TTL ~10s · SQLite cache ~3s · watchlist/bar cache TTL ~30s · "
+            f"page auto-rerun ~**{refresh_seconds}s** when `streamlit-autorefresh` is installed.",
+        )
+
+    with tab_ac:
+        st.subheader("Live / Paper account (Alpaca)")
+        st.caption("Read-only **TradingClient** snapshot — same data as the bot would see for orders.")
+        render_alpaca_account_cards(
+            equity=equity,
+            cash=cash,
+            bp=bp,
+            open_unreal_f=open_unreal_f,
+            daily_realized=daily_realized,
+            metrics=metrics,
+        )
+        st.markdown("---")
+        if go is not None and pos_rows:
+            st.subheader("Current asset allocation")
+            pdf = pd.DataFrame(pos_rows)
+            if "Symbol" in pdf.columns and "Market Value" in pdf.columns:
+                pdf["Market Value"] = pd.to_numeric(pdf["Market Value"], errors="coerce").fillna(0.0)
+                pdf = pdf[pdf["Market Value"] > 0]
+                if not pdf.empty:
+                    fig2 = go.Figure(
+                        data=[
+                            go.Pie(
+                                labels=pdf["Symbol"],
+                                values=pdf["Market Value"],
+                                hole=0.42,
+                                marker=dict(line=dict(color="#0b0e11", width=1)),
+                            ),
+                        ],
+                    )
+                    fig2.update_layout(
+                        template="plotly_dark",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        height=360,
+                        showlegend=True,
+                        margin=dict(l=20, r=20, t=40, b=20),
+                    )
+                    st.plotly_chart(fig2, width="stretch")
+                else:
+                    st.info("No positive market-value positions.")
+            else:
+                st.info("Unexpected position payload shape.")
+        elif not pos_rows:
+            st.info("No open positions from Alpaca (or API unavailable).")
+        else:
+            st.warning("Install **plotly** for allocation chart: `pip install plotly`.")
+
+        st.subheader("Open positions")
+        if pos_rows:
+            st.dataframe(pd.DataFrame(pos_rows), width="stretch", hide_index=True)
+        else:
+            st.caption("No rows (or Alpaca unavailable).")
+
+        st.subheader("Recent trades (SQLite, latest 25)")
+        recent_df = db_pack.get("recent")
+        if isinstance(recent_df, pd.DataFrame) and not recent_df.empty:
+            st.dataframe(recent_df, width="stretch", hide_index=True)
+        else:
+            st.caption("No completed trades loaded.")
+
+    runs_all = load_replay_runs(str(resolved_db), limit=200)
+
+    with tab_rr:
+        st.subheader("Replay runs")
+        if runs_all.empty:
+            st.info("No `replay_runs` rows (or table missing).")
+        else:
+            if selected_replay_run:
+                st.success(f"Sidebar filter active: **`{selected_replay_run}`** — charts use this `run_id`.")
+            summ_all = build_replay_runs_summary_table(resolved_db, runs_all)
+            if not summ_all.empty:
+                pct_cols = [c for c in summ_all.columns if "return" in c.lower() or c == "SPY return"]
+                disp_sum = summ_all.copy()
+                for c in pct_cols:
+                    if c in disp_sum.columns:
+
+                        def _fmt_pct(v: Any) -> Any:
+                            if v is None or (isinstance(v, float) and pd.isna(v)):
+                                return "—"
+                            try:
+                                return f"{float(v) * 100:.2f}%"
+                            except (TypeError, ValueError):
+                                return v
+
+                        disp_sum[c] = disp_sum[c].map(_fmt_pct)
+                st.dataframe(disp_sum, width="stretch", hide_index=True)
+                st.caption(
+                    "Final equity uses the **ensemble** book when present, else the mean of **ind::** books. "
+                    "SPY return is from `benchmark_equity` in `equity_snapshots`.",
+                )
+            with st.expander("Raw `replay_runs` table"):
+                st.dataframe(runs_all, width="stretch", hide_index=True)
+
+    eq_df_run = pd.DataFrame()
+    tr_df_run = pd.DataFrame()
+    initial_eq = 100_000.0
+    if selected_replay_run:
+        eq_df_run = load_equity_snapshots(
+            str(resolved_db),
+            run_id=selected_replay_run,
+            source_scope="replay",
+        )
+        tr_df_run = load_completed_trades_by_run(
+            str(resolved_db),
+            run_id=selected_replay_run,
+            source_scope="replay",
+        )
+        match = runs_all[runs_all["run_id"] == selected_replay_run] if not runs_all.empty else pd.DataFrame()
+        if not match.empty and "initial_equity" in match.columns:
+            try:
+                initial_eq = float(match.iloc[0]["initial_equity"])
+            except (TypeError, ValueError):
+                initial_eq = 100_000.0
+
+    cmp_df = build_strategy_comparison_table(eq_df_run, tr_df_run, initial_equity=initial_eq)
+
+    with tab_sc:
+        st.subheader("Strategy comparison (replay)")
+        if not selected_replay_run:
+            st.info("Select a **replay run** in the sidebar to load per-strategy metrics.")
+        elif cmp_df.empty:
+            st.info("No `equity_snapshots` for this run (or missing `strategy_name`).")
+        else:
+            show = cmp_df.copy()
+
+            def _pct_cell(x: Any) -> str:
+                if x is None:
+                    return "—"
+                if isinstance(x, str):
+                    return x
+                try:
+                    v = float(x)
+                except (TypeError, ValueError):
+                    return "—"
+                if pd.isna(v):
+                    return "—"
+                return f"{v * 100:.2f}%"
+
+            for col in ("total_return", "benchmark_return", "excess_return", "max_drawdown", "win_rate"):
+                if col in show.columns:
+                    show[col] = show[col].map(_pct_cell)
+            if "sharpe_simple" in show.columns:
+                show["sharpe_simple"] = show["sharpe_simple"].map(
+                    lambda x: "—"
+                    if x is None or (isinstance(x, float) and pd.isna(x))
+                    else f"{float(x):.2f}",
+                )
+            st.caption("Sharpe uses equity step returns × √252 (rough; intraday replay is indicative only).")
+            st.dataframe(show, width="stretch", hide_index=True)
+            if go is not None:
+                figb = go.Figure(
+                    data=[
+                        go.Bar(
+                            x=cmp_df["strategy_name"],
+                            y=cmp_df["total_return"] * 100.0,
+                            marker_color="#38bdf8",
+                            name="Total return %",
+                        ),
+                    ],
+                )
+                figb.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    height=320,
+                    yaxis_title="Return %",
+                    margin=dict(l=40, r=20, t=30, b=80),
+                )
+                st.plotly_chart(figb, width="stretch")
+            if not eq_df_run.empty and "strategy_name" in eq_df_run.columns and go is not None:
+                st.subheader("Equity by strategy")
+                piv = eq_df_run.pivot_table(
+                    index="timestamp",
+                    columns="strategy_name",
+                    values="equity",
+                    aggfunc="last",
+                )
+                figm = go.Figure()
+                for c in piv.columns:
+                    figm.add_trace(go.Scatter(x=piv.index, y=piv[c], mode="lines", name=str(c)))
+                figm.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    height=360,
+                    margin=dict(l=40, r=20, t=30, b=40),
+                )
+                st.plotly_chart(figm, width="stretch")
+                st.subheader("Max drawdown by strategy")
+                fig_dd = go.Figure(
+                    data=[
+                        go.Bar(
+                            x=cmp_df["strategy_name"],
+                            y=cmp_df["max_drawdown"] * 100.0,
+                            marker_color="#f97316",
+                            name="Max drawdown %",
+                        ),
+                    ],
+                )
+                fig_dd.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    height=300,
+                    yaxis_title="Drawdown % (negative)",
+                    margin=dict(l=40, r=20, t=30, b=80),
+                )
+                st.plotly_chart(fig_dd, width="stretch")
+                st.subheader("Trade count by strategy")
+                fig_nt = go.Figure(
+                    data=[
+                        go.Bar(
+                            x=cmp_df["strategy_name"],
+                            y=cmp_df["n_trades"],
+                            marker_color="#a78bfa",
+                            name="Trades",
+                        ),
+                    ],
+                )
+                fig_nt.update_layout(
+                    template="plotly_dark",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    height=300,
+                    yaxis_title="Count",
+                    margin=dict(l=40, r=20, t=30, b=80),
+                )
+                st.plotly_chart(fig_nt, width="stretch")
+
+    with tab_eq:
+        st.subheader("Equity & drawdown (replay)")
+        if not selected_replay_run:
+            st.info("Select a replay run in the sidebar.")
+        elif eq_df_run.empty:
+            st.info("No equity snapshots for this run.")
+        else:
+            eq_local = eq_df_run.copy()
+            if "timestamp" in eq_local.columns:
+                eq_local["_ts"] = pd.to_datetime(eq_local["timestamp"], utc=True, errors="coerce")
+            st_names = eq_local["strategy_name"].dropna().unique() if "strategy_name" in eq_local.columns else []
+            for strat in sorted(st_names, key=str):
+                sub = eq_local[eq_local["strategy_name"] == strat]
+                tsort = "_ts" if "_ts" in sub.columns else "timestamp"
+                if tsort not in sub.columns:
+                    continue
+                sub = sub.sort_values(tsort)
+                if sub.empty or "equity" not in sub.columns:
+                    continue
+                eqs = pd.to_numeric(sub["equity"], errors="coerce")
+                dd = eqs / eqs.cummax() - 1.0
+                chart = pd.DataFrame(
+                    {
+                        "time": sub["_ts"] if "_ts" in sub.columns else sub["timestamp"],
+                        "equity": eqs,
+                        "drawdown": dd,
+                    },
+                )
+                st.markdown(f"**{strat}**")
+                st.line_chart(chart.set_index("time")[["equity", "drawdown"]])
+            if "benchmark_equity" in eq_local.columns and "timestamp" in eq_local.columns:
+                bdf = (
+                    eq_local.sort_values("timestamp")
+                    .drop_duplicates(subset=["timestamp"])[["timestamp", "benchmark_equity"]]
+                    .dropna(subset=["benchmark_equity"])
+                )
+                if len(bdf) > 1:
+                    st.markdown("**SPY / benchmark (deduped timestamps)**")
+                    st.line_chart(bdf.rename(columns={"timestamp": "time"}).set_index("time"))
+            if "cash" in eq_local.columns and "gross_exposure" in eq_local.columns and "timestamp" in eq_local.columns:
+                ce = eq_local.sort_values("timestamp")
+                st.markdown("**Cash vs gross exposure (last portfolio row per timestamp)**")
+                ce2 = ce.drop_duplicates(subset=["timestamp"], keep="last")
+                if not ce2.empty:
+                    st.line_chart(
+                        ce2.rename(columns={"timestamp": "time"})[["time", "cash", "gross_exposure"]].set_index("time"),
+                    )
+
+    with tab_tr:
+        st.subheader("Completed trades")
+        scope_tr = st.selectbox(
+            "Source scope",
+            ["replay", "all", "live", "shadow", "dry_run", "simulation"],
+            index=0,
+            key="tr_scope",
+        )
+        tr_view = load_completed_trades_by_run(
+            str(resolved_db),
+            run_id=selected_replay_run,
+            source_scope=scope_tr,
+        )
+        if tr_view.empty:
+            st.info("No trades for this filter.")
+        else:
+            st.dataframe(tr_view, width="stretch", hide_index=True)
+
+    with tab_sym:
+        st.subheader("Symbol drilldown")
+        if not selected_replay_run:
+            st.info("Select a replay run in the sidebar.")
+        else:
+            sig_df = load_strategy_signals(str(resolved_db), run_id=selected_replay_run)
+            sym_opts = sorted(
+                {str(x).upper() for x in tr_df_run["symbol"].dropna().astype(str).unique()},
+            ) if "symbol" in tr_df_run.columns else []
+            if not sig_df.empty and "symbol" in sig_df.columns:
+                sym_opts = sorted(
+                    set(sym_opts) | {str(x).upper() for x in sig_df["symbol"].dropna().astype(str).unique()},
+                )
+            sym_pick = st.selectbox("Symbol", options=sym_opts or ["—"], key="drill_sym")
+            rdir = discover_replay_output_dir(settings, selected_replay_run) if selected_replay_run else None
+            price_df = pd.DataFrame()
+            if rdir and sym_pick and sym_pick != "—":
+                for pat in (f"bars__*{sym_pick}*.csv", f"*{sym_pick}*ohlc*.csv", "bars.csv"):
+                    hits = list(rdir.glob(pat))
+                    if hits:
+                        try:
+                            price_df = pd.read_csv(hits[0])
+                            break
+                        except OSError:
+                            price_df = pd.DataFrame()
+            if not price_df.empty and "close" in price_df.columns:
+                idx0 = price_df.columns[0]
+                chart_cols = ["close"]
+                for extra in ("rsi", "RSI"):
+                    if extra in price_df.columns:
+                        chart_cols.append(extra)
+                        break
+                st.line_chart(price_df.set_index(idx0)[chart_cols])
+            elif not tr_df_run.empty and sym_pick != "—" and "symbol" in tr_df_run.columns:
+                t_sym = tr_df_run[tr_df_run["symbol"].fillna("").astype(str).str.upper() == sym_pick]
+                pts = []
+                if "opened_at" in t_sym.columns and "entry_price" in t_sym.columns:
+                    pts.append(t_sym[["opened_at", "entry_price"]].rename(columns={"opened_at": "time", "entry_price": "price"}))
+                if "closed_at" in t_sym.columns and "exit_price" in t_sym.columns:
+                    pts.append(t_sym[["closed_at", "exit_price"]].rename(columns={"closed_at": "time", "exit_price": "price"}))
+                if pts:
+                    merged = pd.concat(pts, ignore_index=True)
+                    merged["_t"] = pd.to_datetime(merged["time"], utc=True, errors="coerce")
+                    merged = merged.dropna(subset=["_t", "price"])
+                    st.caption("Entry / exit markers (from `completed_trades`).")
+                    st.line_chart(merged.sort_values("_t").set_index("_t")[["price"]])
+                else:
+                    st.info("No entry/exit price columns for markers.")
+            else:
+                st.info("No historical OHLC CSV in replay output folder; showing signals/skips for symbol below.")
+            if sym_pick and sym_pick != "—" and not sig_df.empty:
+                sg = sig_df[sig_df["symbol"].fillna("").astype(str).str.upper() == sym_pick]
+                st.subheader("Signals (symbol)")
+                st.dataframe(sg.head(500), width="stretch", hide_index=True)
+            sk = load_skip_events(str(resolved_db), run_id=selected_replay_run)
+            if sym_pick and sym_pick != "—" and not sk.empty and "symbol" in sk.columns:
+                st.subheader("Skip events (symbol)")
+                st.dataframe(
+                    sk[sk["symbol"].fillna("").astype(str).str.upper() == sym_pick].head(500),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+    with tab_sig:
+        st.subheader("Strategy signals")
+        if not selected_replay_run:
+            st.info("Select a replay run for filtered signals, or browse recent rows below.")
+        sig_all = load_strategy_signals(str(resolved_db), run_id=selected_replay_run, limit=2000)
+        if sig_all.empty:
+            st.info("No `strategy_signals` rows.")
+        else:
+            st.dataframe(sig_all, width="stretch", hide_index=True)
+        st.subheader("Skip events")
+        sk_all = load_skip_events(str(resolved_db), run_id=selected_replay_run)
+        if sk_all.empty:
+            st.info("No `skip_events` rows.")
+        else:
+            st.dataframe(sk_all.head(2000), width="stretch", hide_index=True)
+            if "skip_code" in sk_all.columns:
+                st.markdown("**Skip counts (reason)**")
+                vc = sk_all["skip_code"].fillna("(none)").value_counts().head(30).rename("count").reset_index()
+                vc.columns = ["skip_code", "count"]
+                st.bar_chart(vc.set_index("skip_code"))
+            if "strategy_name" in sk_all.columns:
+                st.markdown("**Skip counts (strategy)**")
+                vc2 = sk_all["strategy_name"].fillna("(none)").value_counts().head(30).rename("count").reset_index()
+                vc2.columns = ["strategy_name", "count"]
+                st.bar_chart(vc2.set_index("strategy_name"))
+        st.subheader("Recent blocked / skip events (debug)")
+        st.caption("Rows from `skip_events` — sizing rejects, risk gates, and replay skips.")
+        sk_dbg = load_skip_events(str(resolved_db), run_id=selected_replay_run, limit=200)
+        if sk_dbg.empty and not selected_replay_run:
+            sk_dbg = load_skip_events(str(resolved_db), run_id=None, limit=200)
+        if sk_dbg.empty:
+            st.info("No skip rows for this filter.")
+        else:
+            st.dataframe(sk_dbg, width="stretch", hide_index=True)
+
+    with tab_ens:
+        st.subheader("Ensemble / combined decisions")
+        dec = load_strategy_decisions(str(resolved_db), run_id=selected_replay_run)
+        if dec.empty:
+            st.info("No `strategy_decisions` rows.")
+        else:
+            m_ens = (
+                dec["decision_type"].fillna("").str.contains("ensemble", case=False, na=False)
+                if "decision_type" in dec.columns
+                else pd.Series(False, index=dec.index)
+            )
+            if "final_action" in dec.columns:
+                m_ens = m_ens | dec["final_action"].fillna("").str.contains(",", na=False)
+            filt = dec[m_ens] if m_ens.any() else dec
+            if not m_ens.any():
+                st.caption("Showing all decisions (none tagged as ensemble).")
+            st.dataframe(filt.head(3000), width="stretch", hide_index=True)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Trading Bot Command Center",
@@ -921,6 +1585,11 @@ def main() -> None:
         "SQLite daily / risk scope",
         options=["live", "simulation", "all"],
         index=0,
+        help=(
+            "live = broker-attributed rows only (source is live or paper). "
+            "Excludes dry_run, replay, shadow, and simulation. "
+            "simulation = legacy replay CSV rows. all = every source."
+        ),
     )
 
     is_paper = settings.is_paper
@@ -961,6 +1630,7 @@ def main() -> None:
     sidebar.write(f"- `DRY_RUN`: **{dry_txt}**")
     sidebar.write(f"- Kill switch: {ks_display}")
     sidebar.write(f"- DB file: {'OK' if db_exists else 'missing'}")
+    render_ensemble_performance_weights_sidebar(settings, resolved_db)
     sidebar.markdown("**Spread filter**")
     sidebar.caption(
         f"- Default `SPREAD_FILTER_PCT`: **{settings.SPREAD_FILTER_PCT:.6f}** "
@@ -1061,6 +1731,19 @@ def main() -> None:
 
     sidebar.caption(f"Alpaca API: **`{'reachable' if alpaca_ok else 'degraded'}`**")
 
+    runs_df_sidebar = load_replay_runs(str(resolved_db), limit=300)
+    sidebar.markdown("**Replay filter**")
+    run_choices = ["(None)"]
+    if not runs_df_sidebar.empty and "run_id" in runs_df_sidebar.columns:
+        run_choices.extend(str(x) for x in runs_df_sidebar["run_id"].tolist())
+    _run_pick = sidebar.selectbox(
+        "Focus `run_id` (charts below)",
+        options=run_choices,
+        index=0,
+        help="Filters replay-oriented tabs. Does not affect live SQLite scope above.",
+    )
+    selected_replay_run = None if _run_pick == "(None)" else _run_pick
+
     # --- Header ---
     st.markdown('<div style="margin-bottom: 8px;">', unsafe_allow_html=True)
     h1_cols = st.columns([4, 1])
@@ -1086,189 +1769,26 @@ def main() -> None:
             )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # --- Metric cards ---
-    mcols = st.columns(8)
-    mc = metrics
-
-    def _metric(idx: int, label: str, value: str, *, profit: bool | None = None) -> None:
-        with mcols[idx]:
-            if profit is True:
-                st.markdown(f'<div class="cc-card profit"><div style="font-size:12px;color:#94a3b8;">{label}</div>'
-                            f'<div style="font-size:22px;font-weight:700;">{value}</div></div>',
-                            unsafe_allow_html=True)
-            elif profit is False:
-                st.markdown(f'<div class="cc-card loss"><div style="font-size:12px;color:#94a3b8;">{label}</div>'
-                            f'<div style="font-size:22px;font-weight:700;">{value}</div></div>',
-                            unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="cc-card"><div style="font-size:12px;color:#94a3b8;">{label}</div>'
-                            f'<div style="font-size:22px;font-weight:700;">{value}</div></div>',
-                            unsafe_allow_html=True)
-
-    eq_s = f"{equity:,.2f}" if equity is not None else "—"
-    cash_s = f"{cash:,.2f}" if cash is not None else "—"
-    bp_s = f"{bp:,.2f}" if bp is not None else "—"
-    ou = open_unreal_f
-    ou_s = f"{ou:,.2f}" if ou is not None else "—"
-    dr = daily_realized
-    dr_s = f"{dr:,.2f}" if dr is not None else "—"
-    wr = f"{float(mc.get('win_rate', 0)) * 100:.1f}%" if mc.get("n_trades", 0) else "—"
-    pf = str(mc.get("profit_factor_label", "N/A"))
-    at = f"{float(mc.get('avg_trade', 0)):,.2f}" if mc.get("n_trades", 0) else "—"
-
-    pr_open = None if ou is None else (True if ou > 1e-6 else (False if ou < -1e-6 else None))
-    pr_day = None if dr is None else (True if dr > 1e-6 else (False if dr < -1e-6 else None))
-
-    _metric(0, "Total equity", eq_s)
-    _metric(1, "Buying power", bp_s)
-    _metric(2, "Cash", cash_s)
-    _metric(3, "Open P/L", ou_s, profit=pr_open)
-    _metric(4, "Realized P/L (today)", dr_s, profit=pr_day)
-    _metric(5, "Win rate (DB)", wr)
-    _metric(6, "Profit factor", pf)
-    _metric(7, "Avg trade (DB)", at)
-
-    st.markdown("---")
-
-    # --- Live Watchlist (market data + RSI; no SQLite trades required) ---
-    st.subheader("Live Watchlist")
-    syms_wl = tuple(watchlist_symbols(settings))
-    wl_rows, wl_err = fetch_watchlist_rows(
-        syms_wl,
-        int(settings.RSI_LENGTH),
-        float(settings.RSI_OVERSOLD),
-        70.0,
+    render_dashboard_phase5_tabs(
+        settings=settings,
+        resolved_db=resolved_db,
+        selected_replay_run=selected_replay_run,
+        env_label=env_label,
+        dry_txt=dry_txt,
+        ks_display=ks_display,
+        metrics=metrics,
+        equity=equity,
+        cash=cash,
+        bp=bp,
+        open_unreal_f=open_unreal_f,
+        daily_realized=daily_realized,
+        hist_df=hist_df,
+        db_pack=db_pack,
+        pos_payload=pos_payload,
+        app_log_path=app_log_path,
+        refresh_seconds=refresh_seconds,
+        go=go,
     )
-    st.caption(
-        f"5-minute bars · RSI length **{settings.RSI_LENGTH}** · "
-        f"signals: **below {settings.RSI_OVERSOLD:.0f}** = Oversold, **above 70** = Overbought · "
-        f"{', '.join(syms_wl)}",
-    )
-    if wl_err:
-        st.warning(f"Live Watchlist unavailable: {wl_err}")
-    elif wl_rows:
-        st.dataframe(pd.DataFrame(wl_rows), width="stretch", hide_index=True)
-    else:
-        st.info("No watchlist rows.")
-
-    st.caption(
-        "Watchlist data updates automatically. This dashboard is read-only and does not place trades.",
-    )
-
-    st.markdown("---")
-
-    # --- Charts ---
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.subheader("Cumulative Realized P/L")
-        if go is not None and not hist_df.empty and "_ts" in hist_df.columns and "_pnl" in hist_df.columns:
-            h2 = hist_df.sort_values("_ts")
-            cum = h2["_pnl"].cumsum()
-            fig = go.Figure()
-            fig.add_trace(
-                go.Scatter(
-                    x=h2["_ts"],
-                    y=cum,
-                    mode="lines",
-                    line=dict(color="#4ade80", width=2),
-                    fill="tozeroy",
-                    fillcolor="rgba(74,222,128,0.12)",
-                ),
-            )
-            fig.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(20,24,30,0.9)",
-                margin=dict(l=40, r=20, t=40, b=40),
-                height=360,
-                xaxis_title="Time",
-                yaxis_title="Cumulative P/L",
-            )
-            st.plotly_chart(fig, width="stretch")
-        elif hist_df.empty:
-            st.info("No trade history in SQLite for cumulative P/L.")
-        else:
-            st.warning("Install **plotly** for the equity curve chart: `pip install plotly`.")
-
-    with c2:
-        st.subheader("Current Asset Allocation")
-        pos_rows = pos_payload.get("positions") or []
-        if go is not None and pos_rows:
-            pdf = pd.DataFrame(pos_rows)
-            if "Symbol" in pdf.columns and "Market Value" in pdf.columns:
-                pdf["Market Value"] = pd.to_numeric(pdf["Market Value"], errors="coerce").fillna(0.0)
-                pdf = pdf[pdf["Market Value"] > 0]
-                if not pdf.empty:
-                    fig2 = go.Figure(
-                        data=[
-                            go.Pie(
-                                labels=pdf["Symbol"],
-                                values=pdf["Market Value"],
-                                hole=0.42,
-                                marker=dict(line=dict(color="#0b0e11", width=1)),
-                            ),
-                        ],
-                    )
-                    fig2.update_layout(
-                        template="plotly_dark",
-                        paper_bgcolor="rgba(0,0,0,0)",
-                        height=360,
-                        showlegend=True,
-                        margin=dict(l=20, r=20, t=40, b=20),
-                    )
-                    st.plotly_chart(fig2, width="stretch")
-                else:
-                    st.info("No positive market-value positions.")
-            else:
-                st.info("Unexpected position payload shape.")
-        elif not pos_rows:
-            st.info("No open positions from Alpaca.")
-        else:
-            st.warning("Install **plotly** for allocation chart: `pip install plotly`.")
-
-    daily_df = db_pack.get("daily")
-    if isinstance(daily_df, pd.DataFrame) and not daily_df.empty and go is not None:
-        st.subheader("Daily Realized P/L (SQLite)")
-        figd = go.Figure(
-            data=[go.Bar(x=daily_df["day"].astype(str), y=daily_df["realized_pnl"], marker_color="#60a5fa")],
-        )
-        figd.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(20,24,30,0.9)",
-            height=300,
-            margin=dict(l=40, r=20, t=30, b=40),
-        )
-        st.plotly_chart(figd, width="stretch")
-
-    st.subheader("Open positions")
-    if pos_rows:
-        st.dataframe(pd.DataFrame(pos_rows), width="stretch", hide_index=True)
-    else:
-        st.caption("No rows (or Alpaca unavailable).")
-
-    st.subheader("Recent trades (SQLite, latest 25)")
-    recent_df = db_pack.get("recent")
-    if isinstance(recent_df, pd.DataFrame) and not recent_df.empty:
-        st.dataframe(recent_df, width="stretch", hide_index=True)
-    else:
-        st.caption("No completed trades loaded.")
-
-    st.subheader("Log monitor (`app.log`, last 50 lines)")
-    log_lines = tail_last_lines(app_log_path, max_lines=50)
-    if log_lines:
-        st.code("\n".join(log_lines), language="")
-    else:
-        st.caption("Log file missing or empty.")
-
-    st.caption(
-        "Read-only Command Center · no orders · no DB writes · no kill-switch mutations. "
-        f"Account/positions cache TTL ~10s · SQLite cache ~3s · watchlist/bar cache TTL ~30s · "
-        f"page auto-rerun ~**{refresh_seconds}s** when `streamlit-autorefresh` is installed.",
-    )
-
-
 # Legacy thread-local cache (kept for any external callers; not used by Streamlit path)
 _alpaca_cache_lock = threading.Lock()
 _alpaca_cache_ts: float = 0.0

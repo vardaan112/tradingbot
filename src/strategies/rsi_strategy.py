@@ -27,6 +27,7 @@ from core.account import PositionSnapshot
 from core.database import Database
 from core.market_data import Quote
 from core.state_store import StateStore, TrailTrailingRecord
+from core.trade_source import runtime_trade_source
 from utils.price_utils import spread_pct as compute_spread_pct
 
 from .base import Signal, SignalAction, Strategy, StrategyContext
@@ -490,6 +491,7 @@ class RSIMeanReversionStrategy(Strategy):
         signal: Signal,
         *,
         quote: Quote | None,
+        eval_clock: datetime,
         last_close: float,
         rsi_value: float,
         atr_value: float,
@@ -506,7 +508,7 @@ class RSIMeanReversionStrategy(Strategy):
             )
         except ValueError:
             sp = 0.0
-        age = quote.age_seconds() if quote is not None else 0.0
+        age = quote.age_seconds(reference=eval_clock) if quote is not None else 0.0
         ov = getattr(signal, "metadata", {}) or {}
         sentiment_score_txt = ov.get("sentiment_score")
         sentiment_label_txt = ov.get("sentiment_label")
@@ -669,6 +671,7 @@ class RSIMeanReversionStrategy(Strategy):
         last_close: float,
         bar_timestamp: datetime | None,
         quote: Quote | None,
+        eval_clock: datetime,
     ) -> dict[str, object]:
         bid = quote.bid if quote is not None else 0.0
         ask = quote.ask if quote is not None else 0.0
@@ -680,7 +683,7 @@ class RSIMeanReversionStrategy(Strategy):
             )
         except ValueError:
             sp = 0.0
-        age = quote.age_seconds() if quote is not None else 0.0
+        age = quote.age_seconds(reference=eval_clock) if quote is not None else 0.0
         return {
             "rsi": rsi_value,
             "atr": atr_value,
@@ -737,6 +740,7 @@ class RSIMeanReversionStrategy(Strategy):
                         "stale_news": stale,
                         "timestamp": ts,
                     },
+                    source=runtime_trade_source(self._settings),
                 )
 
     def _log_scale_in_candidate(
@@ -1035,6 +1039,7 @@ class RSIMeanReversionStrategy(Strategy):
             last_close=last_close,
             bar_timestamp=bar_ts,
             quote=ctx.quote,
+            eval_clock=ctx.now_utc,
         )
         common_meta = {
             "sector": sector,
@@ -1095,6 +1100,7 @@ class RSIMeanReversionStrategy(Strategy):
                 self._log_signal(
                     signal,
                     quote=ctx.quote,
+                    eval_clock=ctx.now_utc,
                     last_close=last_close,
                     rsi_value=last_rsi,
                     atr_value=last_atr,
@@ -1163,6 +1169,7 @@ class RSIMeanReversionStrategy(Strategy):
                 self._log_signal(
                     signal,
                     quote=ctx.quote,
+                    eval_clock=ctx.now_utc,
                     last_close=last_close,
                     rsi_value=last_rsi,
                     atr_value=last_atr,
@@ -1203,6 +1210,7 @@ class RSIMeanReversionStrategy(Strategy):
                 self._log_signal(
                     signal,
                     quote=ctx.quote,
+                    eval_clock=ctx.now_utc,
                     last_close=last_close,
                     rsi_value=last_rsi,
                     atr_value=last_atr,
@@ -1231,7 +1239,7 @@ class RSIMeanReversionStrategy(Strategy):
             spread_threshold_pct: float | None = None
             if ctx.quote is not None:
                 with contextlib.suppress(AttributeError, TypeError, ValueError):
-                    quote_age_seconds = float(ctx.quote.age_seconds())
+                    quote_age_seconds = float(ctx.quote.age_seconds(reference=ctx.now_utc))
                 with contextlib.suppress(ValueError):
                     if ctx.quote.bid > 0 and ctx.quote.ask > ctx.quote.bid:
                         spread_pct_value = float(compute_spread_pct(ctx.quote.bid, ctx.quote.ask))
@@ -1641,6 +1649,7 @@ class RSIMeanReversionStrategy(Strategy):
             self._log_signal(
                 signal,
                 quote=ctx.quote,
+                eval_clock=ctx.now_utc,
                 last_close=last_close,
                 rsi_value=last_rsi,
                 atr_value=last_atr,
@@ -1660,7 +1669,7 @@ class RSIMeanReversionStrategy(Strategy):
         qa_live: float | None = None
         if ctx.quote is not None:
             try:
-                qa_live = float(ctx.quote.age_seconds())
+                qa_live = float(ctx.quote.age_seconds(reference=ctx.now_utc))
             except (AttributeError, TypeError, ValueError):
                 qa_live = None
             try:
@@ -2199,6 +2208,7 @@ class RSIMeanReversionStrategy(Strategy):
         self._log_signal(
             signal,
             quote=ctx.quote,
+            eval_clock=ctx.now_utc,
             last_close=last_close,
             rsi_value=last_rsi,
             atr_value=last_atr,
